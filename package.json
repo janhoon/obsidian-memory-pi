@@ -1,0 +1,17 @@
+{
+  "name": "obsidian-memory-pi",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": ["pi-package", "obsidian", "memory", "qmd"],
+  "description": "Markdown-first Obsidian memory package for Pi with QMD-backed retrieval.",
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/obsidian-memory"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  }
+}
