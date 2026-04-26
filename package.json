@@ -4,6 +4,11 @@
   "private": true,
   "keywords": ["pi-package", "obsidian", "memory", "qmd"],
   "description": "Markdown-first Obsidian memory package for Pi with QMD-backed retrieval.",
+  "scripts": {
+    "qmd:sync": "bash scripts/qmd-memory-sync.sh",
+    "qmd:update": "bash scripts/qmd-memory-sync.sh --no-embed",
+    "qmd:status": "bash scripts/qmd-memory-sync.sh --status-only"
+  },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
