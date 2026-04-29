@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { StringEnum } from "@mariozechner/pi-ai";
 import {
   getAgentDir,
@@ -15,6 +16,11 @@ const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
 const SCOPES = ["project", "global", "session", "all"] as const;
 type MemoryScope = (typeof SCOPES)[number];
+const INGEST_KINDS = ["auto", "document", "image", "video", "audio"] as const;
+type IngestKindInput = (typeof INGEST_KINDS)[number];
+type IngestKind = Exclude<IngestKindInput, "auto">;
+const DOCLING_IMAGE_EXPORT_MODES = ["placeholder", "embedded", "referenced"] as const;
+type DoclingImageExportMode = (typeof DOCLING_IMAGE_EXPORT_MODES)[number];
 
 type ProjectMapping = {
   cwdPattern: string;
@@ -53,6 +59,20 @@ type MemoryConfig = {
     enabled: boolean;
     maxTurns: number;
     includeFiles: boolean;
+  };
+  ingest: {
+    doclingCommand: string;
+    ffmpegCommand: string;
+    doclingTimeoutMs: number;
+    ffmpegTimeoutMs: number;
+    qmdSyncAfterIngest: boolean;
+    qmdUpdateTimeoutMs: number;
+    qmdEmbedTimeoutMs: number;
+    maxSourceCopyBytes: number;
+    maxExtractedCharsInMemory: number;
+    videoFrameIntervalSec: number;
+    maxVideoFrames: number;
+    doclingImageExportMode: DoclingImageExportMode;
   };
   projectMappings: ProjectMapping[];
 };
@@ -180,6 +200,21 @@ const DEFAULT_PRE_COMPACTION_FLUSH = {
   includeFiles: true,
 } as const;
 
+const DEFAULT_INGEST_CONFIG = {
+  doclingCommand: "docling",
+  ffmpegCommand: "ffmpeg",
+  doclingTimeoutMs: 120_000,
+  ffmpegTimeoutMs: 120_000,
+  qmdSyncAfterIngest: true,
+  qmdUpdateTimeoutMs: 60_000,
+  qmdEmbedTimeoutMs: 180_000,
+  maxSourceCopyBytes: 25 * 1024 * 1024,
+  maxExtractedCharsInMemory: 50_000,
+  videoFrameIntervalSec: 30,
+  maxVideoFrames: 12,
+  doclingImageExportMode: "placeholder" as DoclingImageExportMode,
+} as const;
+
 const MEMORY_STATUS_SCHEMA = Type.Object({});
 const MEMORY_SEARCH_SCHEMA = Type.Object({
   query: Type.String({ description: "Search query for the knowledge base" }),
@@ -222,6 +257,16 @@ const MEMORY_AUDIT_SCHEMA = Type.Object({
   scope: Type.Optional(StringEnum(SCOPES)),
   project: Type.Optional(Type.String({ description: "Project slug override" })),
   staleDays: Type.Optional(Type.Number({ description: "Staleness threshold in days", minimum: 1, maximum: 3650 })),
+});
+const MEMORY_INGEST_SOURCE_SCHEMA = Type.Object({
+  source: Type.String({ description: "Local file path or http(s) URL to ingest into memory" }),
+  kind: Type.Optional(StringEnum(INGEST_KINDS)),
+  title: Type.Optional(Type.String({ description: "Optional human-readable title for the source note" })),
+  project: Type.Optional(Type.String({ description: "Project slug override" })),
+  tags: Type.Optional(Type.Array(Type.String(), { description: "Optional tags to add to the generated memory note" })),
+  copySource: Type.Optional(Type.Boolean({ description: "Copy the raw source into sources/ when possible. Defaults to true for non-video inputs." })),
+  refreshIndex: Type.Optional(Type.Boolean({ description: "Run QMD update/embed after writing. Defaults to config.ingest.qmdSyncAfterIngest." })),
+  targetPath: Type.Optional(Type.String({ description: "Optional vault-relative memory/ path for the generated note" })),
 });
 
 function expandHome(input: string): string {
@@ -306,6 +351,46 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
       enabled: config.preCompactionFlush?.enabled ?? DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: config.preCompactionFlush?.maxTurns || DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
       includeFiles: config.preCompactionFlush?.includeFiles ?? DEFAULT_PRE_COMPACTION_FLUSH.includeFiles,
+    },
+    ingest: {
+      doclingCommand: config.ingest?.doclingCommand || DEFAULT_INGEST_CONFIG.doclingCommand,
+      ffmpegCommand: config.ingest?.ffmpegCommand || DEFAULT_INGEST_CONFIG.ffmpegCommand,
+      doclingTimeoutMs:
+        Number.isFinite(config.ingest?.doclingTimeoutMs) && (config.ingest?.doclingTimeoutMs ?? 0) > 0
+          ? config.ingest?.doclingTimeoutMs ?? DEFAULT_INGEST_CONFIG.doclingTimeoutMs
+          : DEFAULT_INGEST_CONFIG.doclingTimeoutMs,
+      ffmpegTimeoutMs:
+        Number.isFinite(config.ingest?.ffmpegTimeoutMs) && (config.ingest?.ffmpegTimeoutMs ?? 0) > 0
+          ? config.ingest?.ffmpegTimeoutMs ?? DEFAULT_INGEST_CONFIG.ffmpegTimeoutMs
+          : DEFAULT_INGEST_CONFIG.ffmpegTimeoutMs,
+      qmdSyncAfterIngest: config.ingest?.qmdSyncAfterIngest ?? DEFAULT_INGEST_CONFIG.qmdSyncAfterIngest,
+      qmdUpdateTimeoutMs:
+        Number.isFinite(config.ingest?.qmdUpdateTimeoutMs) && (config.ingest?.qmdUpdateTimeoutMs ?? 0) > 0
+          ? config.ingest?.qmdUpdateTimeoutMs ?? DEFAULT_INGEST_CONFIG.qmdUpdateTimeoutMs
+          : DEFAULT_INGEST_CONFIG.qmdUpdateTimeoutMs,
+      qmdEmbedTimeoutMs:
+        Number.isFinite(config.ingest?.qmdEmbedTimeoutMs) && (config.ingest?.qmdEmbedTimeoutMs ?? 0) > 0
+          ? config.ingest?.qmdEmbedTimeoutMs ?? DEFAULT_INGEST_CONFIG.qmdEmbedTimeoutMs
+          : DEFAULT_INGEST_CONFIG.qmdEmbedTimeoutMs,
+      maxSourceCopyBytes:
+        Number.isFinite(config.ingest?.maxSourceCopyBytes) && (config.ingest?.maxSourceCopyBytes ?? -1) >= 0
+          ? config.ingest?.maxSourceCopyBytes ?? DEFAULT_INGEST_CONFIG.maxSourceCopyBytes
+          : DEFAULT_INGEST_CONFIG.maxSourceCopyBytes,
+      maxExtractedCharsInMemory:
+        Number.isFinite(config.ingest?.maxExtractedCharsInMemory) && (config.ingest?.maxExtractedCharsInMemory ?? -1) >= 0
+          ? config.ingest?.maxExtractedCharsInMemory ?? DEFAULT_INGEST_CONFIG.maxExtractedCharsInMemory
+          : DEFAULT_INGEST_CONFIG.maxExtractedCharsInMemory,
+      videoFrameIntervalSec:
+        Number.isFinite(config.ingest?.videoFrameIntervalSec) && (config.ingest?.videoFrameIntervalSec ?? 0) > 0
+          ? config.ingest?.videoFrameIntervalSec ?? DEFAULT_INGEST_CONFIG.videoFrameIntervalSec
+          : DEFAULT_INGEST_CONFIG.videoFrameIntervalSec,
+      maxVideoFrames:
+        Number.isFinite(config.ingest?.maxVideoFrames) && (config.ingest?.maxVideoFrames ?? -1) >= 0
+          ? config.ingest?.maxVideoFrames ?? DEFAULT_INGEST_CONFIG.maxVideoFrames
+          : DEFAULT_INGEST_CONFIG.maxVideoFrames,
+      doclingImageExportMode: DOCLING_IMAGE_EXPORT_MODES.includes(config.ingest?.doclingImageExportMode as DoclingImageExportMode)
+        ? (config.ingest?.doclingImageExportMode as DoclingImageExportMode)
+        : DEFAULT_INGEST_CONFIG.doclingImageExportMode,
     },
     projectMappings: config.projectMappings || [],
   };
@@ -437,7 +522,8 @@ function detectExplicitMemoryIntent(prompt: string, patterns: readonly string[],
 function didPersistMemoryThisTurn(messages: Array<any>): boolean {
   return messages.some(
     (message) =>
-      message?.role === "toolResult" && ["memory_propose_write", "memory_write", "memory_record_decision"].includes(String(message?.toolName || "")),
+      message?.role === "toolResult" &&
+      ["memory_propose_write", "memory_write", "memory_record_decision", "memory_ingest_source"].includes(String(message?.toolName || "")),
   );
 }
 
@@ -647,6 +733,9 @@ function renderStatus(state: RuntimeState, qmdStatus?: string, pendingReviewCoun
     `Auto session notes: ${state.config?.autoSessionNotes.enabled ? "on" : "off"}`,
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
+    `Docling command: ${state.config?.ingest.doclingCommand || DEFAULT_INGEST_CONFIG.doclingCommand}`,
+    `FFmpeg command: ${state.config?.ingest.ffmpegCommand || DEFAULT_INGEST_CONFIG.ffmpegCommand}`,
+    `Media ingest QMD sync: ${state.config?.ingest.qmdSyncAfterIngest ? "on" : "off"}`,
   ];
 
   if (qmdStatus) {
@@ -815,6 +904,691 @@ async function writeVaultFile(config: MemoryConfig, inputPath: string, content: 
       await writeFile(absolutePath, content, "utf8");
     }
   });
+}
+
+type MemoryIngestParams = {
+  source: string;
+  kind?: IngestKindInput;
+  title?: string;
+  project?: string;
+  tags?: string[];
+  copySource?: boolean;
+  refreshIndex?: boolean;
+  targetPath?: string;
+};
+
+type SourceCopyResult = {
+  path?: string;
+  bytes?: number;
+  sha256?: string;
+  skippedReason?: string;
+};
+
+type DoclingConversionResult = {
+  markdown: string;
+  outputFiles: string[];
+  stderr?: string;
+};
+
+type MemoryIngestResult = {
+  source: string;
+  kind: IngestKind;
+  title: string;
+  project: string;
+  memoryPath: string;
+  sourceDir: string;
+  copiedSource?: SourceCopyResult;
+  derivedPaths: string[];
+  framePaths: string[];
+  warnings: string[];
+  qmdRefreshed: boolean;
+};
+
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"]);
+const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".mpeg", ".mpg"]);
+const AUDIO_EXTENSIONS = new Set([".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac", ".opus", ".webm"]);
+
+function isHttpUrl(input: string): boolean {
+  try {
+    const url = new URL(input);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function splitCommandLine(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | undefined;
+  let escaping = false;
+
+  for (const char of input.trim()) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaping) current += "\\";
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+async function runConfiguredCommand(
+  pi: ExtensionAPI,
+  commandLine: string,
+  args: string[],
+  options: { timeout?: number; signal?: AbortSignal } = {},
+) {
+  const parts = splitCommandLine(commandLine || "");
+  const command = parts[0] || commandLine;
+  const prefixArgs = parts.slice(1);
+  if (!command) throw new Error("Missing command.");
+  return pi.exec(command, [...prefixArgs, ...args], options);
+}
+
+function safeSlug(input: string): string {
+  const slug = input
+    .toLowerCase()
+    .replace(/[’']/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return slug || "source";
+}
+
+function yamlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function titleFromSource(source: string): string {
+  try {
+    if (isHttpUrl(source)) {
+      const url = new URL(source);
+      const decodedName = decodeURIComponent(basename(url.pathname || ""));
+      const withoutExt = decodedName ? decodedName.replace(/\.[^.]+$/, "") : url.hostname;
+      return withoutExt.replace(/[\-_]+/g, " ").trim() || url.hostname || "media source";
+    }
+  } catch {
+    // fall through to local path handling
+  }
+
+  const normalized = normalizePathArg(source);
+  const name = basename(normalized).replace(/\.[^.]+$/, "");
+  return name.replace(/[\-_]+/g, " ").trim() || "media source";
+}
+
+function resolveLocalSourcePath(source: string): string {
+  const normalized = normalizePathArg(source.trim());
+  if (normalized.startsWith("file://")) {
+    const url = new URL(normalized);
+    return decodeURIComponent(url.pathname);
+  }
+  return resolve(expandHome(normalized));
+}
+
+function extensionFromContentType(contentType?: string): string | undefined {
+  const normalized = contentType?.split(";")[0]?.trim().toLowerCase();
+  switch (normalized) {
+    case "image/png":
+      return ".png";
+    case "image/jpeg":
+      return ".jpg";
+    case "image/webp":
+      return ".webp";
+    case "image/gif":
+      return ".gif";
+    case "video/mp4":
+      return ".mp4";
+    case "video/webm":
+      return ".webm";
+    case "audio/mpeg":
+      return ".mp3";
+    case "audio/wav":
+    case "audio/x-wav":
+      return ".wav";
+    case "application/pdf":
+      return ".pdf";
+    case "text/markdown":
+      return ".md";
+    case "text/html":
+      return ".html";
+    default:
+      return undefined;
+  }
+}
+
+function inferSourceExtension(source: string, contentType?: string): string {
+  let candidate = source;
+  try {
+    if (isHttpUrl(source)) candidate = new URL(source).pathname;
+  } catch {
+    // keep raw candidate
+  }
+
+  const ext = extname(candidate).toLowerCase();
+  if (/^\.[a-z0-9]{1,10}$/.test(ext)) return ext;
+  return extensionFromContentType(contentType) || ".bin";
+}
+
+function inferIngestKind(source: string, requested?: IngestKindInput): IngestKind {
+  if (requested && requested !== "auto") return requested;
+  const ext = inferSourceExtension(source);
+  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+  if (AUDIO_EXTENSIONS.has(ext)) return "audio";
+  return "document";
+}
+
+function sha256Buffer(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+async function sha256File(path: string): Promise<string> {
+  return sha256Buffer(await readFile(path));
+}
+
+async function writeVaultSourceFile(config: MemoryConfig, inputPath: string, content: string | Buffer) {
+  const { absolutePath, relativePath } = resolveVaultFile(config, inputPath);
+  if (!relativePath.startsWith("sources/")) {
+    throw new Error(`Source writes are restricted to sources/: ${relativePath}`);
+  }
+
+  await withFileMutationQueue(absolutePath, async () => {
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, content);
+  });
+}
+
+async function copyVaultSourceFile(config: MemoryConfig, sourcePath: string, inputPath: string) {
+  const { absolutePath, relativePath } = resolveVaultFile(config, inputPath);
+  if (!relativePath.startsWith("sources/")) {
+    throw new Error(`Source writes are restricted to sources/: ${relativePath}`);
+  }
+
+  await withFileMutationQueue(absolutePath, async () => {
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await copyFile(sourcePath, absolutePath);
+  });
+}
+
+async function fetchWithTimeout(url: string, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } catch (error) {
+    if (timedOut) throw new Error(`download timed out after ${timeoutMs}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+async function copyOriginalSourceToVault(
+  config: MemoryConfig,
+  params: { source: string; conversionSource: string; kind: IngestKind; sourceDir: string; copySource?: boolean; signal?: AbortSignal },
+): Promise<SourceCopyResult> {
+  const shouldCopy = params.copySource ?? (params.kind !== "video" && params.kind !== "audio");
+  if (!shouldCopy) return { skippedReason: params.kind === "video" ? "video raw source is referenced, not copied by default" : "copySource=false" };
+
+  const maxBytes = config.ingest.maxSourceCopyBytes;
+  if (maxBytes <= 0) return { skippedReason: "raw source copying disabled by maxSourceCopyBytes=0" };
+
+  if (isHttpUrl(params.source)) {
+    const response = await fetchWithTimeout(params.source, config.ingest.doclingTimeoutMs, params.signal);
+    if (!response.ok) return { skippedReason: `download failed with HTTP ${response.status}` };
+
+    const contentLength = Number(response.headers.get("content-length") || "0");
+    if (contentLength > maxBytes) return { skippedReason: `remote source is ${contentLength} bytes, above ${maxBytes} byte copy limit` };
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > maxBytes) return { skippedReason: `remote source is ${buffer.byteLength} bytes, above ${maxBytes} byte copy limit` };
+
+    const ext = inferSourceExtension(params.source, response.headers.get("content-type") || undefined);
+    const targetPath = `${params.sourceDir}/original${ext}`;
+    await writeVaultSourceFile(config, targetPath, buffer);
+    return { path: targetPath, bytes: buffer.byteLength, sha256: sha256Buffer(buffer) };
+  }
+
+  const info = await stat(params.conversionSource);
+  if (!info.isFile()) return { skippedReason: "local source is not a regular file" };
+  if (info.size > maxBytes) return { skippedReason: `local source is ${info.size} bytes, above ${maxBytes} byte copy limit` };
+
+  const targetPath = `${params.sourceDir}/original${inferSourceExtension(params.conversionSource)}`;
+  await copyVaultSourceFile(config, params.conversionSource, targetPath);
+  return { path: targetPath, bytes: info.size, sha256: await sha256File(params.conversionSource) };
+}
+
+async function readMarkdownOutputs(root: string): Promise<{ markdown: string; files: string[] }> {
+  const files = (await collectMarkdownFiles(root)).sort();
+  if (files.length === 0) return { markdown: "", files: [] };
+  const parts: string[] = [];
+  for (const file of files) {
+    const content = (await readFile(file, "utf8")).trim();
+    if (!content) continue;
+    if (files.length === 1) {
+      parts.push(content);
+    } else {
+      parts.push(`## ${basename(file, ".md")}\n\n${content}`);
+    }
+  }
+  return { markdown: parts.join("\n\n---\n\n"), files };
+}
+
+function doclingArgsForKind(kind: IngestKind): string[] {
+  if (kind === "image") return ["--from", "image"];
+  if (kind === "audio") return ["--from", "audio", "--pipeline", "asr"];
+  if (kind === "video") return ["--pipeline", "asr"];
+  return [];
+}
+
+function cleanDoclingStderr(stderr: string): string | undefined {
+  const lines = stderr
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line && !line.includes("An executable named `docling` is not provided by package `docling`"));
+  const cleaned = lines.join("\n").trim();
+  return cleaned || undefined;
+}
+
+async function runDoclingConversion(
+  pi: ExtensionAPI,
+  config: MemoryConfig,
+  source: string,
+  kind: IngestKind,
+  tempRoot: string,
+  signal?: AbortSignal,
+): Promise<DoclingConversionResult> {
+  const outputDir = await mkdtemp(join(tempRoot, "docling-"));
+  const timeoutSeconds = Math.max(1, Math.ceil(config.ingest.doclingTimeoutMs / 1000));
+  const args = [
+    source,
+    ...doclingArgsForKind(kind),
+    "--to",
+    "md",
+    "--output",
+    outputDir,
+    "--image-export-mode",
+    config.ingest.doclingImageExportMode,
+    "--document-timeout",
+    String(timeoutSeconds),
+  ];
+
+  const result = await runConfiguredCommand(pi, config.ingest.doclingCommand, args, { timeout: config.ingest.doclingTimeoutMs, signal });
+  if (result.code !== 0) {
+    throw new Error((result.stderr || result.stdout || `docling exited with code ${result.code}`).trim());
+  }
+
+  const { markdown, files } = await readMarkdownOutputs(outputDir);
+  const stdoutMarkdown = result.stdout.trim();
+  const outputMarkdown = markdown || stdoutMarkdown;
+  if (!outputMarkdown) throw new Error("docling completed but produced no markdown output.");
+  return { markdown: outputMarkdown, outputFiles: files, stderr: cleanDoclingStderr(result.stderr) };
+}
+
+async function extractVideoFrames(
+  pi: ExtensionAPI,
+  config: MemoryConfig,
+  source: string,
+  tempRoot: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  if (config.ingest.maxVideoFrames <= 0) return [];
+
+  const framesDir = join(tempRoot, "frames");
+  await mkdir(framesDir, { recursive: true });
+  const pattern = join(framesDir, "frame-%03d.png");
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-y",
+    "-i",
+    source,
+    "-vf",
+    `fps=1/${config.ingest.videoFrameIntervalSec}`,
+    "-frames:v",
+    String(config.ingest.maxVideoFrames),
+    pattern,
+  ];
+  const result = await runConfiguredCommand(pi, config.ingest.ffmpegCommand, args, { timeout: config.ingest.ffmpegTimeoutMs, signal });
+  if (result.code !== 0) {
+    throw new Error((result.stderr || result.stdout || `ffmpeg exited with code ${result.code}`).trim());
+  }
+
+  const entries = await readdir(framesDir, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".png"))
+    .map((entry) => join(framesDir, entry.name))
+    .sort();
+}
+
+async function copyFrameFilesToSources(config: MemoryConfig, frameFiles: string[], sourceDir: string): Promise<string[]> {
+  const copied: string[] = [];
+  for (const frameFile of frameFiles) {
+    const targetPath = `${sourceDir}/frames/${basename(frameFile)}`;
+    await copyVaultSourceFile(config, frameFile, targetPath);
+    copied.push(targetPath);
+  }
+  return copied;
+}
+
+async function persistDerivedMarkdown(config: MemoryConfig, sourceDir: string, fileName: string, markdown: string): Promise<string | undefined> {
+  const trimmed = markdown.trim();
+  if (!trimmed) return undefined;
+  const path = `${sourceDir}/${fileName}`;
+  await writeVaultSourceFile(config, path, trimmed + "\n");
+  return path;
+}
+
+function limitExtractedMarkdown(markdown: string, maxChars: number): { content: string; truncated: boolean } {
+  const trimmed = markdown.trim();
+  if (!trimmed) return { content: "_No extracted text was produced._", truncated: false };
+  if (maxChars <= 0) return { content: "_Extracted markdown was stored under sources/ and omitted from this memory note by configuration._", truncated: true };
+  if (trimmed.length <= maxChars) return { content: trimmed, truncated: false };
+  return {
+    content: `${trimmed.slice(0, maxChars).trimEnd()}\n\n_Extraction truncated in memory note after ${maxChars} characters; see sources/ for full markdown._`,
+    truncated: true,
+  };
+}
+
+function buildIngestMemoryNote(params: {
+  title: string;
+  project: string;
+  kind: IngestKind;
+  source: string;
+  sourceDir: string;
+  copiedSource?: SourceCopyResult;
+  derivedPaths: string[];
+  framePaths: string[];
+  extractedMarkdown: string;
+  tags: string[];
+  warnings: string[];
+  ingestedAt: string;
+  maxExtractedChars: number;
+}): string {
+  const date = params.ingestedAt.slice(0, 10);
+  const limited = limitExtractedMarkdown(params.extractedMarkdown, params.maxExtractedChars);
+  const tags = [...new Set(["memory-ingest", "media-ingest", params.kind, ...params.tags.map(safeSlug)].filter(Boolean))];
+  const frontmatter = [
+    "---",
+    "type: source_ingest",
+    "scope: project",
+    `project: ${yamlString(params.project)}`,
+    "relevance: medium",
+    `source_kind: ${params.kind}`,
+    `source_uri: ${yamlString(params.source)}`,
+    `source_dir: ${yamlString(params.sourceDir)}`,
+    params.copiedSource?.path ? `source_stored: ${yamlString(params.copiedSource.path)}` : undefined,
+    params.derivedPaths.length > 0 ? `derived_markdown: ${yamlString(params.derivedPaths[0])}` : undefined,
+    `ingested_at: ${yamlString(params.ingestedAt)}`,
+    `last_reviewed: ${date}`,
+    "tags:",
+    ...tags.map((tag) => `  - ${tag}`),
+    "---",
+  ].filter(Boolean) as string[];
+
+  const provenance = [
+    `- Source: ${params.source}`,
+    `- Kind: ${params.kind}`,
+    `- Source directory: \`${params.sourceDir}\``,
+    params.copiedSource?.path ? `- Copied source: \`${params.copiedSource.path}\`` : `- Copied source: ${params.copiedSource?.skippedReason || "not copied"}`,
+    params.copiedSource?.bytes !== undefined ? `- Copied bytes: ${params.copiedSource.bytes}` : undefined,
+    params.copiedSource?.sha256 ? `- SHA-256: \`${params.copiedSource.sha256}\`` : undefined,
+    params.derivedPaths.length > 0 ? `- Derived markdown: ${params.derivedPaths.map((path) => `\`${path}\``).join(", ")}` : undefined,
+    params.framePaths.length > 0 ? `- Sampled frames: ${params.framePaths.length} frame(s) under \`${params.sourceDir}/frames/\`` : undefined,
+    limited.truncated ? "- Memory note extraction: truncated; full derived markdown is in sources/." : undefined,
+  ].filter(Boolean) as string[];
+
+  const lines = [
+    ...frontmatter,
+    `# ${params.title}`,
+    "",
+    "## Summary",
+    "",
+    `Automated Docling ingest for a ${params.kind} source. This note was written directly so the extracted material can participate in memory search and later audits can merge, deduplicate, or clean up overlap.`,
+    "",
+    "## Provenance",
+    "",
+    ...provenance,
+  ];
+
+  if (params.warnings.length > 0) {
+    lines.push("", "## Warnings", "", ...params.warnings.map((warning) => `- ${warning}`));
+  }
+
+  lines.push("", "## Extracted content", "", limited.content, "");
+  return lines.join("\n");
+}
+
+async function refreshQmdAfterIngest(pi: ExtensionAPI, config: MemoryConfig, signal?: AbortSignal): Promise<string[]> {
+  const warnings: string[] = [];
+  const update = await runConfiguredCommand(pi, config.qmdCommand, ["update"], { timeout: config.ingest.qmdUpdateTimeoutMs, signal });
+  if (update.code !== 0) {
+    warnings.push(`qmd update failed: ${(update.stderr || update.stdout || `exit ${update.code}`).trim()}`);
+    return warnings;
+  }
+
+  const embed = await runConfiguredCommand(
+    pi,
+    config.qmdCommand,
+    ["embed", "--max-docs-per-batch", "32", "--max-batch-mb", "8"],
+    { timeout: config.ingest.qmdEmbedTimeoutMs, signal },
+  );
+  if (embed.code !== 0) {
+    warnings.push(`qmd embed failed: ${(embed.stderr || embed.stdout || `exit ${embed.code}`).trim()}`);
+  }
+  return warnings;
+}
+
+function renderIngestResult(result: MemoryIngestResult): string {
+  const lines = [
+    `Ingested ${result.kind}: ${result.title}`,
+    `Memory note: ${result.memoryPath}`,
+    `Source directory: ${result.sourceDir}`,
+    result.copiedSource?.path ? `Copied source: ${result.copiedSource.path}` : undefined,
+    result.derivedPaths.length > 0 ? `Derived markdown: ${result.derivedPaths.join(", ")}` : undefined,
+    result.framePaths.length > 0 ? `Frames: ${result.framePaths.length}` : undefined,
+    `QMD refreshed: ${result.qmdRefreshed ? "yes" : "no"}`,
+  ].filter(Boolean) as string[];
+  if (result.warnings.length > 0) lines.push("", "Warnings:", ...result.warnings.map((warning) => `- ${warning}`));
+  return lines.join("\n");
+}
+
+async function ingestMemorySource(
+  pi: ExtensionAPI,
+  config: MemoryConfig,
+  runtimeProject: string | undefined,
+  params: MemoryIngestParams,
+  signal?: AbortSignal,
+  onProgress?: (message: string) => void,
+): Promise<MemoryIngestResult> {
+  const source = normalizePathArg(params.source || "").trim();
+  if (!source) throw new Error("memory_ingest_source requires a source path or URL.");
+  const isUrl = isHttpUrl(source);
+  if (!isUrl && /^[a-z]+:\/\//i.test(source) && !source.startsWith("file://")) {
+    throw new Error("Only local paths, file:// URLs, and http(s) URLs are supported for source ingest.");
+  }
+
+  const conversionSource = isUrl ? source : resolveLocalSourcePath(source);
+  if (!isUrl) {
+    const info = await stat(conversionSource);
+    if (!info.isFile()) throw new Error(`Local source is not a regular file: ${conversionSource}`);
+  }
+
+  const kind = inferIngestKind(source, params.kind);
+  const project = safeSlug(params.project || runtimeProject || "unknown");
+  const title = (params.title || titleFromSource(source)).replace(/\s+/g, " ").trim() || "Media source";
+  const slug = safeSlug(title);
+  const ingestedAt = new Date().toISOString();
+  const date = ingestedAt.slice(0, 10);
+  const ingestId = `${ingestedAt.slice(0, 19).replace(/[:T]/g, "-")}-${randomUUID().slice(0, 8)}`;
+  const sourceDir = `sources/media/${project}/${date}/${ingestId}-${slug}`;
+  const memoryPath = normalizeVaultRelativePath(params.targetPath || `memory/projects/${project}/ingests/${ingestId}-${slug}.md`);
+  const warnings: string[] = [];
+  const derivedPaths: string[] = [];
+  let framePaths: string[] = [];
+  const extractedSections: string[] = [];
+  const tempRoot = await mkdtemp(join(tmpdir(), "obsidian-memory-ingest-"));
+
+  try {
+    onProgress?.("copying source provenance…");
+    let copiedSource: SourceCopyResult | undefined;
+    try {
+      copiedSource = await copyOriginalSourceToVault(config, {
+        source,
+        conversionSource,
+        kind,
+        sourceDir,
+        copySource: params.copySource,
+        signal,
+      });
+      if (copiedSource.skippedReason) warnings.push(`Raw source not copied: ${copiedSource.skippedReason}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(`Raw source copy failed: ${message}`);
+      copiedSource = { skippedReason: message };
+    }
+
+    if (kind === "video") {
+      onProgress?.("running Docling ASR on video…");
+      try {
+        const transcript = await runDoclingConversion(pi, config, conversionSource, "video", tempRoot, signal);
+        extractedSections.push(`# Transcript\n\n${transcript.markdown.trim()}`);
+        const transcriptPath = await persistDerivedMarkdown(config, sourceDir, "transcript.md", transcript.markdown);
+        if (transcriptPath) derivedPaths.push(transcriptPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        warnings.push(`Docling ASR for video failed: ${message}`);
+      }
+
+      onProgress?.("sampling video frames with ffmpeg…");
+      try {
+        const frameFiles = await extractVideoFrames(pi, config, conversionSource, tempRoot, signal);
+        framePaths = await copyFrameFilesToSources(config, frameFiles, sourceDir);
+        if (frameFiles.length > 0) {
+          onProgress?.("running Docling OCR on sampled frames…");
+          const frameMarkdown = await runDoclingConversion(pi, config, dirname(frameFiles[0]), "image", tempRoot, signal);
+          extractedSections.push(`# Sampled frame OCR\n\n${frameMarkdown.markdown.trim()}`);
+          const framesMarkdownPath = await persistDerivedMarkdown(config, sourceDir, "frames.md", frameMarkdown.markdown);
+          if (framesMarkdownPath) derivedPaths.push(framesMarkdownPath);
+        } else {
+          warnings.push("ffmpeg produced no sampled frames.");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        warnings.push(`Video frame extraction/OCR failed: ${message}`);
+      }
+
+      if (extractedSections.length === 0) {
+        throw new Error(`Video ingest produced no extracted text. ${warnings.join(" ")}`.trim());
+      }
+    } else {
+      onProgress?.("running Docling conversion…");
+      const conversion = await runDoclingConversion(pi, config, conversionSource, kind, tempRoot, signal);
+      extractedSections.push(conversion.markdown.trim());
+      const derivedPath = await persistDerivedMarkdown(config, sourceDir, "docling.md", conversion.markdown);
+      if (derivedPath) derivedPaths.push(derivedPath);
+      if (conversion.stderr) warnings.push(`Docling stderr: ${truncateText(conversion.stderr, 500)}`);
+    }
+
+    const extractedMarkdown = extractedSections.join("\n\n---\n\n");
+    if (kind === "video") {
+      const combinedPath = await persistDerivedMarkdown(config, sourceDir, "docling.md", extractedMarkdown);
+      if (combinedPath && !derivedPaths.includes(combinedPath)) derivedPaths.unshift(combinedPath);
+    }
+
+    onProgress?.("writing memory note…");
+    const note = buildIngestMemoryNote({
+      title,
+      project,
+      kind,
+      source,
+      sourceDir,
+      copiedSource,
+      derivedPaths,
+      framePaths,
+      extractedMarkdown,
+      tags: params.tags || [],
+      warnings,
+      ingestedAt,
+      maxExtractedChars: config.ingest.maxExtractedCharsInMemory,
+    });
+    await writeVaultFile(config, memoryPath, note, false);
+
+    const logEntry = [
+      `\n## [${ingestedAt.slice(0, 16).replace("T", " ")}] source-ingest | ${title}`,
+      "",
+      `- Kind: ${kind}`,
+      `- Source: ${source}`,
+      `- Memory note: [[${memoryPath.replace(/^memory\//, "").replace(/\.md$/i, "")}]]`,
+      `- Source directory: ${sourceDir}`,
+      "",
+    ].join("\n");
+    await writeVaultFile(config, "memory/log.md", logEntry, true);
+
+    let qmdRefreshed = false;
+    const shouldRefresh = params.refreshIndex ?? config.ingest.qmdSyncAfterIngest;
+    if (shouldRefresh) {
+      onProgress?.("refreshing QMD index…");
+      try {
+        const qmdWarnings = await refreshQmdAfterIngest(pi, config, signal);
+        warnings.push(...qmdWarnings);
+        qmdRefreshed = qmdWarnings.length === 0;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        warnings.push(`QMD refresh failed: ${message}`);
+      }
+    }
+
+    return {
+      source,
+      kind,
+      title,
+      project,
+      memoryPath,
+      sourceDir,
+      copiedSource,
+      derivedPaths,
+      framePaths,
+      warnings,
+      qmdRefreshed,
+    };
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 }
 
 function sanitizeDecisionTitle(title: string): string {
@@ -1416,7 +2190,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       | undefined;
 
     if (pendingMemoryIntent && runtimeState.config?.autoPropose.enabled) {
-      systemPrompt += `\n\nExplicit memory request detected for this turn. Before finishing, create a durable memory artifact. Prefer memory_propose_write over memory_write unless the user explicitly asked for an immediate write. Suggested target: ${pendingMemoryIntent.targetPath}. If the request is clearly a durable project decision with title, summary, and rationale, prefer memory_record_decision.`;
+      systemPrompt += `\n\nExplicit memory request detected for this turn. Before finishing, create a durable memory artifact. If the request provides a local path or URL to an image, video, document, or other source, prefer memory_ingest_source. Otherwise prefer memory_propose_write over memory_write unless the user explicitly asked for an immediate write. Suggested target: ${pendingMemoryIntent.targetPath}. If the request is clearly a durable project decision with title, summary, and rationale, prefer memory_record_decision.`;
     }
 
     if (shouldAutoRecall(event.prompt, runtimeState) && runtimeState.config) {
@@ -1797,6 +2571,40 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "memory_ingest_source",
+    label: "Memory Ingest Source",
+    description: "Ingest a local path or URL with Docling, store source provenance, write a memory note, and refresh QMD.",
+    promptSnippet: "Ingest images, videos, documents, or URLs into the Obsidian memory base using Docling.",
+    promptGuidelines: [
+      "Use memory_ingest_source when the user provides a local path or URL that should contribute to long-term memory.",
+      "memory_ingest_source writes directly to memory/ and stores raw or derived source artifacts under sources/; do not call memory_propose_write for the same source.",
+      "For video inputs, memory_ingest_source attempts Docling ASR plus ffmpeg frame sampling and OCR.",
+    ],
+    parameters: MEMORY_INGEST_SOURCE_SCHEMA,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      return runWithMemoryActivity(
+        ctx,
+        `memory: ingesting ${formatMemoryTarget(params.source)}`,
+        "memory: ingest complete",
+        "memory: ingest failed",
+        async () => {
+          if (!runtimeState.ready || !runtimeState.config) {
+            throw new Error("Memory system is not configured.");
+          }
+
+          const result = await ingestMemorySource(pi, runtimeState.config, runtimeState.project, params, signal, (message) => {
+            onUpdate?.({ content: [{ type: "text", text: message }] });
+          });
+          return {
+            content: [{ type: "text", text: renderIngestResult(result) }],
+            details: result,
+          };
+        },
+      );
+    },
+  });
+
   pi.registerCommand("memory-status", {
     description: "Show obsidian-memory runtime status",
     handler: async (_args, ctx) => {
@@ -1831,6 +2639,71 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`memory-search failed: ${message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("memory-ingest", {
+    description: "Ingest a local path or URL into memory with Docling: /memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]",
+    handler: async (args, ctx) => {
+      const parts = splitCommandLine(args.trim());
+      const positional: string[] = [];
+      let kind: IngestKindInput | undefined;
+      let copySource: boolean | undefined;
+      let refreshIndex: boolean | undefined;
+      for (let index = 0; index < parts.length; index++) {
+        const part = parts[index];
+        if (part === "--kind") {
+          const value = parts[++index] as IngestKindInput | undefined;
+          if (!value || !INGEST_KINDS.includes(value)) {
+            ctx.ui.notify(`Invalid --kind. Expected one of: ${INGEST_KINDS.join(", ")}`, "warning");
+            return;
+          }
+          kind = value;
+          continue;
+        }
+        if (part === "--copy") {
+          copySource = true;
+          continue;
+        }
+        if (part === "--no-copy") {
+          copySource = false;
+          continue;
+        }
+        if (part === "--no-refresh") {
+          refreshIndex = false;
+          continue;
+        }
+        positional.push(part);
+      }
+
+      const source = positional[0];
+      const title = positional.slice(1).join(" ").trim() || undefined;
+      if (!source) {
+        ctx.ui.notify("Usage: /memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]", "warning");
+        return;
+      }
+
+      runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
+      reviewQueue = await loadReviewQueue();
+      updateUi(ctx);
+      if (!runtimeState.ready || !runtimeState.config) {
+        ctx.ui.notify("Memory system is not configured.", "error");
+        return;
+      }
+
+      try {
+        const result = await runWithMemoryActivity(
+          ctx,
+          `memory: ingesting ${formatMemoryTarget(source)}`,
+          "memory: ingest complete",
+          "memory: ingest failed",
+          () => ingestMemorySource(pi, runtimeState.config as MemoryConfig, runtimeState.project, { source, title, kind, copySource, refreshIndex }),
+        );
+        ctx.ui.notify(renderIngestResult(result), result.warnings.length > 0 ? "warning" : "success");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`memory-ingest failed: ${message}`, "error");
       }
     },
   });

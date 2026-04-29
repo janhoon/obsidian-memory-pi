@@ -14,7 +14,7 @@ last_reviewed: 2026-04-15
 
 ## Operations
 
-- **ingest**: process new sources into maintained notes
+- **ingest**: process new sources into maintained notes; media/source ingests may write generated notes under `memory/projects/<project>/ingests/` and artifacts under `sources/media/`
 - **query**: answer from the wiki and file back important synthesis
 - **maintain**: keep active context, progress, and decisions current
 - **audit**: check for stale, missing, duplicated, or contradictory notes
@@ -29,7 +29,7 @@ last_reviewed: 2026-04-15
 
 ## Writing rules
 
-- write concise summaries, not transcripts
+- write concise summaries, not transcripts, except generated source-ingest notes that preserve extracted text for retrieval and later audit
 - preserve wikilinks where they add navigation value
 - prefer one durable fact per note section
 - decisions should include rationale

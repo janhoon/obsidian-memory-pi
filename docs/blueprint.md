@@ -14,7 +14,7 @@ Make persistent memory feel native inside Pi by combining:
 - raw sources are immutable
 - QMD only helps find the right files
 - Pi decides when memory should be fetched or written
-- durable writes are conservative and reviewable
+- durable writes are conservative and reviewable by default, except trusted source/media ingest flows that write generated notes directly
 - sparse loading beats dumping the whole vault into context
 
 ## Package components
@@ -36,6 +36,7 @@ Responsibilities:
   - `memory_review_status`
   - `memory_audit`
   - `memory_record_decision`
+  - `memory_ingest_source`
 - auto-inject relevant memory before answers when triggers match
 - write automatic session summaries under `memory/sessions/<project>/YYYY-MM-DD.md`
 - auto-queue review proposals when the user explicitly says things like `remember this` or `save this`
@@ -44,6 +45,7 @@ Responsibilities:
   - `/memory-status`
   - `/memory-search <query>`
   - `/memory-review [list|show|pick|apply|discard] [id|next|all]`
+  - `/memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]`
   - `/memory-audit-now [scope] [project] [staleDays]`
   - `/memory-init-config`
   - `/memory-reload`
@@ -213,12 +215,36 @@ Behavior:
 - appends an entry to `memory/projects/<project>/decisions/index.md`
 - appends a log entry to `memory/log.md`
 
+### `memory_ingest_source`
+
+Inputs:
+
+- `source`: local file path, `file://` URL, or `http(s)` URL
+- optional `kind`: `auto | document | image | video | audio`
+- optional `title`
+- optional `project`
+- optional `tags`
+- optional `copySource`
+- optional `refreshIndex`
+- optional `targetPath` under `memory/`
+
+Behavior:
+
+- shells out to Docling (`ingest.doclingCommand`) to convert source material to Markdown
+- for videos, attempts Docling ASR and `ffmpeg` frame sampling followed by Docling OCR on sampled frames
+- copies non-video raw sources into `sources/media/<project>/...` when they are below the configured size limit
+- stores full derived Markdown and sampled frames under `sources/media/<project>/...`
+- writes a generated memory note directly under `memory/projects/<project>/ingests/` by default
+- appends a log entry to `memory/log.md`
+- runs QMD update/embed by default so the generated note participates in retrieval
+
 ## Canonical vault shape
 
 ```text
 vault/
 ├── AGENTS.md
 ├── sources/
+│   └── media/
 └── memory/
     ├── schema.md
     ├── index.md
@@ -228,6 +254,7 @@ vault/
     ├── glossary.md
     ├── global/
     ├── projects/
+    │   └── <project>/ingests/
     └── sessions/
 ```
 
@@ -292,6 +319,20 @@ vault/
     "enabled": true,
     "maxTurns": 8,
     "includeFiles": true
+  },
+  "ingest": {
+    "doclingCommand": "docling",
+    "ffmpegCommand": "ffmpeg",
+    "doclingTimeoutMs": 120000,
+    "ffmpegTimeoutMs": 120000,
+    "qmdSyncAfterIngest": true,
+    "qmdUpdateTimeoutMs": 60000,
+    "qmdEmbedTimeoutMs": 180000,
+    "maxSourceCopyBytes": 26214400,
+    "maxExtractedCharsInMemory": 50000,
+    "videoFrameIntervalSec": 30,
+    "maxVideoFrames": 12,
+    "doclingImageExportMode": "placeholder"
   }
 }
 ```
@@ -314,7 +355,7 @@ vault/
 - explicit-memory auto capture
 - pre-compaction flush
 - better project mapping
-- source ingest flow
+- initial Docling-backed source ingest flow
 
 ### Phase 3
 
