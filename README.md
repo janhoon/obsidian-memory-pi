@@ -26,6 +26,8 @@ This package is the first implementation pass. It currently provides:
   - `/memory-init-config`
   - `/memory-reload`
   - automatic pre-answer memory recall heuristics via `before_agent_start`
+  - below-editor memory activity indicators for recall, reads, searches, writes, review, and audit operations
+  - configurable auto-recall timeout / activity-clear delay under `autoRecall.timeoutMs` and `autoRecall.clearDelayMs`
   - automatic proposal queuing for explicit `remember this` / `save this` style requests
   - automatic session-note writing on session start and agent completion
   - pre-compaction session flushing before Pi compresses context
@@ -97,6 +99,8 @@ A starter file is available at:
 ```text
 ~/.pi/agent/memory/config.example.json
 ```
+
+Automatic recall uses `autoRecall.timeoutMs` (default `60000`) and `autoRecall.clearDelayMs` (default `5000`) when those fields are omitted from config.
 
 ## Suggested next steps
 

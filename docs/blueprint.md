@@ -83,6 +83,7 @@ Starter markdown files for the canonical wiki layout.
 ### `before_agent_start`
 
 - detect continuity / memory / decision / context language
+- show a compact below-editor recall activity indicator while QMD lookup is running
 - run a lightweight QMD lookup
 - inject compact memory context
 - instruct the model to call `memory_get` for full-note reads when needed
@@ -261,6 +262,8 @@ vault/
   "autoRecall": {
     "enabled": true,
     "maxResults": 4,
+    "timeoutMs": 60000,
+    "clearDelayMs": 5000,
     "triggerPatterns": [
       "continue",
       "last session",
