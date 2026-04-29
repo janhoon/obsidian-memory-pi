@@ -36,6 +36,8 @@ type MemoryConfig = {
   autoRecall: {
     enabled: boolean;
     maxResults: number;
+    timeoutMs: number;
+    clearDelayMs: number;
     triggerPatterns: string[];
   };
   autoSessionNotes: {
@@ -96,6 +98,14 @@ type PendingMemoryIntent = {
   targetPath: string;
 };
 
+type MemoryActivityState = "running" | "complete" | "failed" | "timed_out";
+
+type MemoryActivity = {
+  id: number;
+  text: string;
+  state: MemoryActivityState;
+};
+
 type MemoryAuditSummary = {
   scope: MemoryScope;
   project?: string;
@@ -141,6 +151,8 @@ const DEFAULT_AUTO_RECALL_PATTERNS = [
   "catch up",
   "project status",
 ] as const;
+const DEFAULT_AUTO_RECALL_TIMEOUT_MS = 60_000;
+const DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS = 5_000;
 
 const DEFAULT_AUTO_SESSION_NOTES = {
   enabled: true,
@@ -271,6 +283,14 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
     autoRecall: {
       enabled: config.autoRecall?.enabled ?? true,
       maxResults: config.autoRecall?.maxResults || 4,
+      timeoutMs:
+        Number.isFinite(config.autoRecall?.timeoutMs) && (config.autoRecall?.timeoutMs ?? 0) > 0
+          ? config.autoRecall?.timeoutMs ?? DEFAULT_AUTO_RECALL_TIMEOUT_MS
+          : DEFAULT_AUTO_RECALL_TIMEOUT_MS,
+      clearDelayMs:
+        Number.isFinite(config.autoRecall?.clearDelayMs) && (config.autoRecall?.clearDelayMs ?? -1) >= 0
+          ? config.autoRecall?.clearDelayMs ?? DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS
+          : DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS,
       triggerPatterns: config.autoRecall?.triggerPatterns || [...DEFAULT_AUTO_RECALL_PATTERNS],
     },
     autoSessionNotes: {
@@ -552,12 +572,19 @@ function buildWidgetLines(
   pendingQueue: ReviewProposal[],
   sessionNotesEnabled: boolean,
   pendingIntent?: PendingMemoryIntent,
+  activity?: MemoryActivity,
 ): string[] {
   const pending = getPendingReviewProposals(pendingQueue);
   const review = ctx.ui.theme.fg(pending.length > 0 ? "warning" : "dim", `review ${pending.length} pending`);
   const notes = ctx.ui.theme.fg(sessionNotesEnabled ? "success" : "dim", `session notes ${sessionNotesEnabled ? "on" : "off"}`);
   const autoCapture = ctx.ui.theme.fg(state.config?.autoPropose.enabled ? "success" : "dim", `auto capture ${state.config?.autoPropose.enabled ? "on" : "off"}`);
   const lines = [ctx.ui.theme.fg("accent", "🧠 memory"), `${review} · ${notes} · ${autoCapture}`];
+
+  if (activity) {
+    const color = activity.state === "complete" ? "success" : activity.state === "running" ? "accent" : "warning";
+    lines.push(ctx.ui.theme.fg(color, activity.text));
+    return lines;
+  }
 
   if (pending.length > 0) {
     const next = pending[0];
@@ -582,6 +609,7 @@ function setStatus(
   pendingQueue: ReviewProposal[] = [],
   sessionNotesEnabled: boolean = false,
   pendingIntent?: PendingMemoryIntent,
+  activity?: MemoryActivity,
 ) {
   if (!ctx.hasUI) return;
 
@@ -589,16 +617,17 @@ function setStatus(
     const pendingReviewCount = getPendingReviewProposals(pendingQueue).length;
     const suffix = pendingReviewCount > 0 ? ` +${pendingReviewCount} review` : "";
     ctx.ui.setStatus("obsidian-memory", `memory:${state.project || "unknown"}${suffix}`);
-    ctx.ui.setWidget("obsidian-memory", buildWidgetLines(ctx, state, pendingQueue, sessionNotesEnabled, pendingIntent), {
+    ctx.ui.setWidget("obsidian-memory", buildWidgetLines(ctx, state, pendingQueue, sessionNotesEnabled, pendingIntent, activity), {
       placement: "belowEditor",
     });
   } else {
     ctx.ui.setStatus("obsidian-memory", "memory:unconfigured");
-    ctx.ui.setWidget(
-      "obsidian-memory",
-      [ctx.ui.theme.fg("warning", "Obsidian memory not configured"), ctx.ui.theme.fg("dim", state.configPath)],
-      { placement: "belowEditor" },
-    );
+    const lines = [ctx.ui.theme.fg("warning", "Obsidian memory not configured"), ctx.ui.theme.fg("dim", state.configPath)];
+    if (activity) {
+      const color = activity.state === "complete" ? "success" : activity.state === "running" ? "accent" : "warning";
+      lines.push(ctx.ui.theme.fg(color, activity.text));
+    }
+    ctx.ui.setWidget("obsidian-memory", lines, { placement: "belowEditor" });
   }
 }
 
@@ -612,6 +641,9 @@ function renderStatus(state: RuntimeState, qmdStatus?: string, pendingReviewCoun
     `QMD collection: ${state.config?.qmdCollection || "(missing)"}`,
     `Default mode: ${state.config?.defaultSearchMode || "hybrid"}`,
     `Pending review items: ${pendingReviewCount}`,
+    `Auto recall: ${state.config?.autoRecall.enabled ? "on" : "off"}`,
+    `Auto recall timeout: ${state.config?.autoRecall.timeoutMs ?? DEFAULT_AUTO_RECALL_TIMEOUT_MS}ms`,
+    `Memory activity clear delay: ${state.config?.autoRecall.clearDelayMs ?? DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS}ms`,
     `Auto session notes: ${state.config?.autoSessionNotes.enabled ? "on" : "off"}`,
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
@@ -699,7 +731,7 @@ function buildQmdArgs(config: MemoryConfig, query: string, mode: SearchMode, lim
 async function runSearch(
   pi: ExtensionAPI,
   state: RuntimeState,
-  options: { query: string; scope: MemoryScope; mode: SearchMode; limit: number; project?: string },
+  options: { query: string; scope: MemoryScope; mode: SearchMode; limit: number; project?: string; timeoutMs?: number },
 ): Promise<{ results: QmdSearchResult[]; attemptedModes: SearchMode[] }> {
   if (!state.ready || !state.config) {
     throw new Error("Memory system is not configured.");
@@ -715,7 +747,7 @@ async function runSearch(
     attemptedModes.push(attempt);
     const args = buildQmdArgs(state.config, options.query, attempt, rawLimit);
     try {
-      const result = await pi.exec(state.config.qmdCommand, args, { timeout: 20000 });
+      const result = await pi.exec(state.config.qmdCommand, args, { timeout: options.timeoutMs ?? 20000 });
       if (result.code !== 0) {
         lastError = (result.stderr || result.stdout || `qmd exited with code ${result.code}`).trim();
         continue;
@@ -734,6 +766,19 @@ async function runSearch(
   }
 
   throw new Error(lastError);
+}
+
+function isTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const lowered = message.toLowerCase();
+  return lowered.includes("timed out") || lowered.includes("timeout");
+}
+
+function formatMemoryTarget(input?: string): string {
+  const trimmed = input?.trim();
+  if (!trimmed) return "memory";
+  const normalized = normalizeVaultRelativePath(normalizePathArg(trimmed));
+  return basename(normalized || trimmed);
 }
 
 function resolveVaultFile(config: MemoryConfig, inputPath: string): { absolutePath: string; relativePath: string } {
@@ -1182,15 +1227,74 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   };
   let reviewQueue: ReviewProposal[] = [];
   let pendingMemoryIntent: PendingMemoryIntent | undefined;
+  let memoryActivity: MemoryActivity | undefined;
+  let memoryActivitySequence = 0;
+  let memoryActivityClearTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const updateUi = (ctx: ExtensionContext) => {
+  const updateUi = (ctx?: ExtensionContext) => {
+    if (!ctx) return;
     setStatus(
       ctx,
       runtimeState,
       reviewQueue,
       Boolean(runtimeState.config?.autoSessionNotes.enabled),
       pendingMemoryIntent,
+      memoryActivity,
     );
+  };
+
+  const clearScheduledMemoryActivity = () => {
+    if (memoryActivityClearTimer) {
+      clearTimeout(memoryActivityClearTimer);
+      memoryActivityClearTimer = undefined;
+    }
+  };
+
+  const beginMemoryActivity = (ctx: ExtensionContext | undefined, text: string): number => {
+    clearScheduledMemoryActivity();
+    const id = ++memoryActivitySequence;
+    memoryActivity = { id, text, state: "running" };
+    updateUi(ctx);
+    return id;
+  };
+
+  const finishMemoryActivity = (ctx: ExtensionContext | undefined, id: number, state: MemoryActivityState, text: string) => {
+    if (!memoryActivity || memoryActivity.id !== id) return;
+
+    clearScheduledMemoryActivity();
+    memoryActivity = { id, text, state };
+    updateUi(ctx);
+
+    const clearDelayMs = runtimeState.config?.autoRecall.clearDelayMs ?? DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS;
+    if (clearDelayMs <= 0) {
+      memoryActivity = undefined;
+      updateUi(ctx);
+      return;
+    }
+
+    memoryActivityClearTimer = setTimeout(() => {
+      if (memoryActivity?.id !== id) return;
+      memoryActivity = undefined;
+      updateUi(ctx);
+    }, clearDelayMs);
+  };
+
+  const runWithMemoryActivity = async <T>(
+    ctx: ExtensionContext | undefined,
+    runningText: string,
+    completeText: string,
+    failedText: string,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const activityId = beginMemoryActivity(ctx, runningText);
+    try {
+      const result = await operation();
+      finishMemoryActivity(ctx, activityId, "complete", completeText);
+      return result;
+    } catch (error) {
+      finishMemoryActivity(ctx, activityId, "failed", failedText);
+      throw error;
+    }
   };
 
   const queueProposal = async (proposal: ReviewProposal | undefined, ctx?: ExtensionContext) => {
@@ -1214,10 +1318,17 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     return { action: "continue" } as const;
   });
 
+  pi.on("session_shutdown", async () => {
+    clearScheduledMemoryActivity();
+    memoryActivity = undefined;
+  });
+
   pi.on("session_start", async (event, ctx) => {
     runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
     reviewQueue = await loadReviewQueue();
     pendingMemoryIntent = undefined;
+    clearScheduledMemoryActivity();
+    memoryActivity = undefined;
     updateUi(ctx);
 
     if (runtimeState.ready && runtimeState.config?.autoSessionNotes.enabled && event.reason !== "reload") {
@@ -1294,7 +1405,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     updateUi(ctx);
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     let systemPrompt = event.systemPrompt;
     let message:
       | {
@@ -1309,12 +1420,14 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     }
 
     if (shouldAutoRecall(event.prompt, runtimeState) && runtimeState.config) {
+      const activityId = beginMemoryActivity(ctx, "recalling memory: searching QMD");
       try {
         const { results } = await runSearch(pi, runtimeState, {
           query: event.prompt,
           scope: "project",
           mode: runtimeState.config.defaultSearchMode,
           limit: runtimeState.config.autoRecall.maxResults,
+          timeoutMs: runtimeState.config.autoRecall.timeoutMs,
         });
 
         if (results.length > 0) {
@@ -1327,7 +1440,14 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           };
           systemPrompt += "\n\nWhen obsidian-memory-context is present, treat it as retrieved memory context. Use memory_get before relying on a note beyond the quoted snippet.";
         }
-      } catch {
+        finishMemoryActivity(ctx, activityId, "complete", "memory recall complete");
+      } catch (error) {
+        finishMemoryActivity(
+          ctx,
+          activityId,
+          isTimeoutError(error) ? "timed_out" : "failed",
+          isTimeoutError(error) ? "memory recall timed out; continuing" : "memory recall failed; continuing",
+        );
         // ignore recall failure and keep other memory behavior
       }
     }
@@ -1345,13 +1465,15 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       "Use this tool when you need to confirm that the memory vault and QMD retrieval layer are configured before relying on memory.",
     ],
     parameters: MEMORY_STATUS_SCHEMA,
-    async execute() {
-      const qmdStatus = await getQmdStatus(pi, runtimeState);
-      const pending = getPendingReviewProposals(reviewQueue);
-      return {
-        content: [{ type: "text", text: renderStatus(runtimeState, qmdStatus, pending.length) }],
-        details: { runtimeState, qmdStatus, pending },
-      };
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(ctx, "memory: checking status…", "memory: status complete", "memory: status failed", async () => {
+        const qmdStatus = await getQmdStatus(pi, runtimeState);
+        const pending = getPendingReviewProposals(reviewQueue);
+        return {
+          content: [{ type: "text", text: renderStatus(runtimeState, qmdStatus, pending.length) }],
+          details: { runtimeState, qmdStatus, pending },
+        };
+      });
     },
   });
 
@@ -1365,29 +1487,31 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       "After memory_search, call memory_get only for the top 1-3 notes you actually need to read in full.",
     ],
     parameters: MEMORY_SEARCH_SCHEMA,
-    async execute(_toolCallId, params) {
-      const mode = params.mode || runtimeState.config?.defaultSearchMode || "hybrid";
-      const scope = params.scope || "project";
-      const limit = params.limit || runtimeState.config?.defaultLimit || 5;
-      const { results, attemptedModes } = await runSearch(pi, runtimeState, {
-        query: params.query,
-        scope,
-        mode,
-        limit,
-        project: params.project,
-      });
-
-      return {
-        content: [{ type: "text", text: summarizeResults(results) }],
-        details: {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(ctx, "memory: searching…", "memory: search complete", "memory: search failed", async () => {
+        const mode = params.mode || runtimeState.config?.defaultSearchMode || "hybrid";
+        const scope = params.scope || "project";
+        const limit = params.limit || runtimeState.config?.defaultLimit || 5;
+        const { results, attemptedModes } = await runSearch(pi, runtimeState, {
           query: params.query,
           scope,
           mode,
-          attemptedModes,
-          project: params.project || runtimeState.project,
-          results,
-        },
-      };
+          limit,
+          project: params.project,
+        });
+
+        return {
+          content: [{ type: "text", text: summarizeResults(results) }],
+          details: {
+            query: params.query,
+            scope,
+            mode,
+            attemptedModes,
+            project: params.project || runtimeState.project,
+            results,
+          },
+        };
+      });
     },
   });
 
@@ -1400,45 +1524,53 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       "Use this after memory_search when you need the full note content for one specific result.",
     ],
     parameters: MEMORY_GET_SCHEMA,
-    async execute(_toolCallId, params) {
-      if (!runtimeState.ready || !runtimeState.config) {
-        throw new Error("Memory system is not configured.");
-      }
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(
+        ctx,
+        `memory: reading ${formatMemoryTarget(params.path)}`,
+        "memory: read complete",
+        "memory: read failed",
+        async () => {
+          if (!runtimeState.ready || !runtimeState.config) {
+            throw new Error("Memory system is not configured.");
+          }
 
-      const normalizedPath = normalizePathArg(params.path);
-      if (normalizedPath.startsWith("#")) {
-        const result = await pi.exec(runtimeState.config.qmdCommand, ["get", normalizedPath], { timeout: 10000 });
-        if (result.code !== 0) {
-          throw new Error((result.stderr || result.stdout || "qmd get failed").trim());
-        }
-        return {
-          content: [{ type: "text", text: result.stdout }],
-          details: { docid: normalizedPath },
-        };
-      }
+          const normalizedPath = normalizePathArg(params.path);
+          if (normalizedPath.startsWith("#")) {
+            const result = await pi.exec(runtimeState.config.qmdCommand, ["get", normalizedPath], { timeout: 10000 });
+            if (result.code !== 0) {
+              throw new Error((result.stderr || result.stdout || "qmd get failed").trim());
+            }
+            return {
+              content: [{ type: "text", text: result.stdout }],
+              details: { docid: normalizedPath },
+            };
+          }
 
-      const vaultRelativePath = normalizeVaultRelativePath(normalizedPath);
-      try {
-        const { absolutePath } = resolveVaultFile(runtimeState.config, vaultRelativePath);
-        if (existsSync(absolutePath)) {
-          const text = await readVaultFile(runtimeState.config, vaultRelativePath, params.offset, params.limit);
+          const vaultRelativePath = normalizeVaultRelativePath(normalizedPath);
+          try {
+            const { absolutePath } = resolveVaultFile(runtimeState.config, vaultRelativePath);
+            if (existsSync(absolutePath)) {
+              const text = await readVaultFile(runtimeState.config, vaultRelativePath, params.offset, params.limit);
+              return {
+                content: [{ type: "text", text }],
+                details: { path: vaultRelativePath, offset: params.offset, limit: params.limit },
+              };
+            }
+          } catch {
+            // fall through to qmd get
+          }
+
+          const qmdResult = await pi.exec(runtimeState.config.qmdCommand, ["get", normalizedPath], { timeout: 10000 });
+          if (qmdResult.code !== 0) {
+            throw new Error((qmdResult.stderr || qmdResult.stdout || `Unable to retrieve ${normalizedPath}`).trim());
+          }
           return {
-            content: [{ type: "text", text }],
-            details: { path: vaultRelativePath, offset: params.offset, limit: params.limit },
+            content: [{ type: "text", text: qmdResult.stdout }],
+            details: { path: normalizedPath, via: "qmd" },
           };
-        }
-      } catch {
-        // fall through to qmd get
-      }
-
-      const qmdResult = await pi.exec(runtimeState.config.qmdCommand, ["get", normalizedPath], { timeout: 10000 });
-      if (qmdResult.code !== 0) {
-        throw new Error((qmdResult.stderr || qmdResult.stdout || `Unable to retrieve ${normalizedPath}`).trim());
-      }
-      return {
-        content: [{ type: "text", text: qmdResult.stdout }],
-        details: { path: normalizedPath, via: "qmd" },
-      };
+        },
+      );
     },
   });
 
@@ -1452,33 +1584,42 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       "Never use this tool for raw sources; it is only for the maintained wiki under memory/.",
     ],
     parameters: MEMORY_WRITE_SCHEMA,
-    async execute(_toolCallId, params) {
-      if (!runtimeState.ready || !runtimeState.config) {
-        throw new Error("Memory system is not configured.");
-      }
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const target = params.action === "append_log" ? "memory/log.md" : params.path;
+      return runWithMemoryActivity(
+        ctx,
+        `memory: writing ${formatMemoryTarget(target)}`,
+        "memory: write complete",
+        "memory: write failed",
+        async () => {
+          if (!runtimeState.ready || !runtimeState.config) {
+            throw new Error("Memory system is not configured.");
+          }
 
-      if (params.action === "append_log") {
-        const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
-        const heading = params.title?.trim() || "memory-update";
-        const entry = `\n## [${stamp}] ${heading}\n\n${params.content.trim()}\n`;
-        await writeVaultFile(runtimeState.config, "memory/log.md", entry, true);
-        return {
-          content: [{ type: "text", text: `Appended log entry to memory/log.md` }],
-          details: { action: params.action, path: "memory/log.md" },
-        };
-      }
+          if (params.action === "append_log") {
+            const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+            const heading = params.title?.trim() || "memory-update";
+            const entry = `\n## [${stamp}] ${heading}\n\n${params.content.trim()}\n`;
+            await writeVaultFile(runtimeState.config, "memory/log.md", entry, true);
+            return {
+              content: [{ type: "text", text: `Appended log entry to memory/log.md` }],
+              details: { action: params.action, path: "memory/log.md" },
+            };
+          }
 
-      const path = params.path?.trim();
-      if (!path) {
-        throw new Error(`Action ${params.action} requires path.`);
-      }
+          const path = params.path?.trim();
+          if (!path) {
+            throw new Error(`Action ${params.action} requires path.`);
+          }
 
-      const appendMode = params.action === "append_file";
-      await writeVaultFile(runtimeState.config, path, params.content, appendMode);
-      return {
-        content: [{ type: "text", text: `${appendMode ? "Appended" : "Wrote"} ${path}` }],
-        details: { action: params.action, path },
-      };
+          const appendMode = params.action === "append_file";
+          await writeVaultFile(runtimeState.config, path, params.content, appendMode);
+          return {
+            content: [{ type: "text", text: `${appendMode ? "Appended" : "Wrote"} ${path}` }],
+            details: { action: params.action, path },
+          };
+        },
+      );
     },
   });
 
@@ -1493,33 +1634,42 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     ],
     parameters: MEMORY_PROPOSE_WRITE_SCHEMA,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!runtimeState.ready || !runtimeState.config) {
-        throw new Error("Memory system is not configured.");
-      }
-      if (params.action !== "append_log" && !params.path?.trim()) {
-        throw new Error(`Action ${params.action} requires path.`);
-      }
+      const target = params.action === "append_log" ? "memory/log.md" : params.path;
+      return runWithMemoryActivity(
+        ctx,
+        `memory: proposing ${formatMemoryTarget(target)}`,
+        "memory: proposal complete",
+        "memory: proposal failed",
+        async () => {
+          if (!runtimeState.ready || !runtimeState.config) {
+            throw new Error("Memory system is not configured.");
+          }
+          if (params.action !== "append_log" && !params.path?.trim()) {
+            throw new Error(`Action ${params.action} requires path.`);
+          }
 
-      const proposal: ReviewProposal = {
-        id: randomUUID().slice(0, 8),
-        createdAt: new Date().toISOString(),
-        project: params.project || runtimeState.project,
-        source: "assistant",
-        rationale: params.rationale,
-        action: params.action,
-        path: params.path,
-        title: params.title,
-        content: params.content,
-        status: "pending",
-      };
-      reviewQueue = [proposal, ...reviewQueue];
-      await saveReviewQueue(reviewQueue);
-      updateUi(ctx);
+          const proposal: ReviewProposal = {
+            id: randomUUID().slice(0, 8),
+            createdAt: new Date().toISOString(),
+            project: params.project || runtimeState.project,
+            source: "assistant",
+            rationale: params.rationale,
+            action: params.action,
+            path: params.path,
+            title: params.title,
+            content: params.content,
+            status: "pending",
+          };
+          reviewQueue = [proposal, ...reviewQueue];
+          await saveReviewQueue(reviewQueue);
+          updateUi(ctx);
 
-      return {
-        content: [{ type: "text", text: `Queued review proposal ${proposal.id}` }],
-        details: { proposal, pendingCount: getPendingReviewProposals(reviewQueue).length },
-      };
+          return {
+            content: [{ type: "text", text: `Queued review proposal ${proposal.id}` }],
+            details: { proposal, pendingCount: getPendingReviewProposals(reviewQueue).length },
+          };
+        },
+      );
     },
   });
 
@@ -1529,16 +1679,18 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     description: "List pending proposed memory writes waiting for review.",
     promptSnippet: "Inspect queued memory write proposals awaiting human review.",
     parameters: MEMORY_REVIEW_STATUS_SCHEMA,
-    async execute() {
-      const pending = getPendingReviewProposals(reviewQueue);
-      const text =
-        pending.length === 0
-          ? "No pending review proposals."
-          : pending.map((proposal) => `- ${renderProposalPreview(proposal)}`).join("\n");
-      return {
-        content: [{ type: "text", text }],
-        details: { pending },
-      };
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(ctx, "memory: checking review…", "memory: review complete", "memory: review failed", async () => {
+        const pending = getPendingReviewProposals(reviewQueue);
+        const text =
+          pending.length === 0
+            ? "No pending review proposals."
+            : pending.map((proposal) => `- ${renderProposalPreview(proposal)}`).join("\n");
+        return {
+          content: [{ type: "text", text }],
+          details: { pending },
+        };
+      });
     },
   });
 
@@ -1552,19 +1704,21 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       "After memory_audit, use memory_get or memory_search only for the flagged notes that need closer inspection.",
     ],
     parameters: MEMORY_AUDIT_SCHEMA,
-    async execute(_toolCallId, params) {
-      if (!runtimeState.ready || !runtimeState.config) {
-        throw new Error("Memory system is not configured.");
-      }
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(ctx, "memory: auditing…", "memory: audit complete", "memory: audit failed", async () => {
+        if (!runtimeState.ready || !runtimeState.config) {
+          throw new Error("Memory system is not configured.");
+        }
 
-      const scope = params.scope || "project";
-      const project = params.project || runtimeState.project;
-      const staleDays = params.staleDays || 30;
-      const summary = await runAudit(runtimeState.config, scope, project, staleDays);
-      return {
-        content: [{ type: "text", text: buildAuditReport(summary) }],
-        details: { summary },
-      };
+        const scope = params.scope || "project";
+        const project = params.project || runtimeState.project;
+        const staleDays = params.staleDays || 30;
+        const summary = await runAudit(runtimeState.config, scope, project, staleDays);
+        return {
+          content: [{ type: "text", text: buildAuditReport(summary) }],
+          details: { summary },
+        };
+      });
     },
   });
 
@@ -1578,66 +1732,68 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       "Ask for missing rationale first if the decision is under-specified, then call this tool once the decision is clear.",
     ],
     parameters: MEMORY_RECORD_DECISION_SCHEMA,
-    async execute(_toolCallId, params) {
-      if (!runtimeState.ready || !runtimeState.config) {
-        throw new Error("Memory system is not configured.");
-      }
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(ctx, "memory: writing decision…", "memory: decision complete", "memory: decision failed", async () => {
+        if (!runtimeState.ready || !runtimeState.config) {
+          throw new Error("Memory system is not configured.");
+        }
 
-      const project = (params.project || runtimeState.project || "").trim();
-      if (!project) {
-        throw new Error("No project slug available for decision recording.");
-      }
+        const project = (params.project || runtimeState.project || "").trim();
+        if (!project) {
+          throw new Error("No project slug available for decision recording.");
+        }
 
-      const date = params.date?.trim() || new Date().toISOString().slice(0, 10);
-      const status = params.status || "adopted";
-      const safeTitle = sanitizeDecisionTitle(params.title);
-      const decisionId = await getNextDecisionId(runtimeState.config, project);
-      const notePath = `memory/projects/${project}/decisions/${decisionId} - ${safeTitle}.md`;
-      const indexPath = `memory/projects/${project}/decisions/index.md`;
-      const noteBody = buildDecisionNote({
-        decisionId,
-        project,
-        title: safeTitle,
-        summary: params.summary,
-        rationale: params.rationale,
-        alternatives: params.alternatives,
-        consequences: params.consequences,
-        status,
-        date,
-      });
-
-      await writeVaultFile(runtimeState.config, notePath, noteBody, false);
-
-      const { absolutePath: indexAbsolutePath } = resolveVaultFile(runtimeState.config, indexPath);
-      if (!existsSync(indexAbsolutePath)) {
-        await writeVaultFile(runtimeState.config, indexPath, buildDecisionIndexHeader(project), false);
-      }
-      await writeVaultFile(
-        runtimeState.config,
-        indexPath,
-        buildDecisionIndexEntry({
-          decisionId,
-          title: safeTitle,
-          summary: params.summary,
-          status,
-          date,
-        }),
-        true,
-      );
-
-      const logEntry = `\n## [${date}] decision | ${decisionId}\n\nRecorded ${decisionId} for project \`${project}\`: ${safeTitle}\n`;
-      await writeVaultFile(runtimeState.config, "memory/log.md", logEntry, true);
-
-      return {
-        content: [{ type: "text", text: `Recorded ${decisionId} at ${notePath}` }],
-        details: {
+        const date = params.date?.trim() || new Date().toISOString().slice(0, 10);
+        const status = params.status || "adopted";
+        const safeTitle = sanitizeDecisionTitle(params.title);
+        const decisionId = await getNextDecisionId(runtimeState.config, project);
+        const notePath = `memory/projects/${project}/decisions/${decisionId} - ${safeTitle}.md`;
+        const indexPath = `memory/projects/${project}/decisions/index.md`;
+        const noteBody = buildDecisionNote({
           decisionId,
           project,
+          title: safeTitle,
+          summary: params.summary,
+          rationale: params.rationale,
+          alternatives: params.alternatives,
+          consequences: params.consequences,
           status,
-          path: notePath,
+          date,
+        });
+
+        await writeVaultFile(runtimeState.config, notePath, noteBody, false);
+
+        const { absolutePath: indexAbsolutePath } = resolveVaultFile(runtimeState.config, indexPath);
+        if (!existsSync(indexAbsolutePath)) {
+          await writeVaultFile(runtimeState.config, indexPath, buildDecisionIndexHeader(project), false);
+        }
+        await writeVaultFile(
+          runtimeState.config,
           indexPath,
-        },
-      };
+          buildDecisionIndexEntry({
+            decisionId,
+            title: safeTitle,
+            summary: params.summary,
+            status,
+            date,
+          }),
+          true,
+        );
+
+        const logEntry = `\n## [${date}] decision | ${decisionId}\n\nRecorded ${decisionId} for project \`${project}\`: ${safeTitle}\n`;
+        await writeVaultFile(runtimeState.config, "memory/log.md", logEntry, true);
+
+        return {
+          content: [{ type: "text", text: `Recorded ${decisionId} at ${notePath}` }],
+          details: {
+            decisionId,
+            project,
+            status,
+            path: notePath,
+            indexPath,
+          },
+        };
+      });
     },
   });
 
