@@ -40,6 +40,7 @@ Responsibilities:
 - auto-inject relevant memory before answers when triggers match
 - write automatic session summaries under `memory/sessions/<project>/YYYY-MM-DD.md`
 - auto-queue review proposals when the user explicitly says things like `remember this` or `save this`
+- route memory intent through a write-policy matrix (Write vs Proposal vs Decision vs Ingest) encoded in runtime helpers
 - flush a compact session snapshot before Pi compacts context
 - expose operator commands:
   - `/memory-status`

@@ -34,3 +34,23 @@ last_reviewed: 2026-04-15
 - prefer one durable fact per note section
 - decisions should include rationale
 - session notes are short-lived and chronological
+
+## Write-policy matrix (content class → action)
+
+Runtime write-policy helpers steer tools; do not rely on skill prose alone.
+
+| Content class | Default action | Safe direct Write? |
+| --- | --- | --- |
+| Session chronology (`memory/sessions/…`) | Write | yes |
+| Progress (`…/progress.md`) | Write | yes |
+| Log (`memory/log.md`) | Write | yes |
+| Working / Active context | Write | yes |
+| Preference | Proposal | no |
+| Doctrine / rules / system patterns | Proposal | no |
+| People fact | Proposal | no |
+| Glossary (ambiguous naming) | Proposal | no |
+| Decision (title + summary + rationale) | Decision record | no (use Decision tool) |
+| Source (path/URL/media) | Ingest | no (use Ingest) |
+| Uncertain durable claim | Proposal | no |
+
+Safe direct targets stay limited to chronological / progress-style Wiki Notes and the Log. Wrong durable Memory is worse than none: preferences and doctrine default to Proposal.

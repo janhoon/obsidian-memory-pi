@@ -34,6 +34,12 @@ import {
   type QmdIndexUiState,
   type QmdSyncMode,
 } from "./qmd-sync-policy.js";
+import {
+  buildWritePolicyGuidance,
+  chooseWritePolicyTarget,
+  routeWritePolicy,
+  type WritePolicyRoute,
+} from "./write-policy.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -156,6 +162,8 @@ type PendingMemoryIntent = {
   matchedPattern: string;
   project?: string;
   targetPath: string;
+  /** Runtime write-policy route for system-prompt steering. */
+  route: WritePolicyRoute;
 };
 
 type MemoryActivityState = "running" | "complete" | "failed" | "timed_out";
@@ -631,13 +639,29 @@ function renderProposalPreview(proposal: ReviewProposal): string {
   return `${proposal.id} · ${proposal.action} · ${resolveProposalTarget(proposal)}${preview ? ` · ${preview}` : ""}`;
 }
 
-function chooseAutoProposalPath(prompt: string, project?: string): string {
+function looksLikeSourceOffer(prompt: string): boolean {
   const lowered = prompt.toLowerCase();
-  const looksGlobal = ["i prefer", "my preference", "for future answers", "in general", "default to"].some((token) =>
-    lowered.includes(token),
-  );
-  if (looksGlobal || !project) return "memory/working-context.md";
-  return `memory/projects/${project}/active-context.md`;
+  if (/\bhttps?:\/\/\S+/i.test(prompt)) return true;
+  if (/(?:^|[\s`"'(])((?:\/|\.\/|\.\.\/)[^\s`"'<>]+|file:\/\/\S+)/.test(prompt)) return true;
+  return /\b(ingest|import)\b/.test(lowered) && /\b(file|path|url|image|video|document|pdf)\b/.test(lowered);
+}
+
+function looksLikeExplicitImmediateWrite(prompt: string): boolean {
+  const lowered = prompt.toLowerCase();
+  return [
+    "write this immediately",
+    "write it now",
+    "don't wait for review",
+    "do not wait for review",
+    "skip review",
+    "apply now",
+    "immediate write",
+  ].some((token) => lowered.includes(token));
+}
+
+function looksLikeCompleteDecisionOffer(prompt: string): boolean {
+  const lowered = prompt.toLowerCase();
+  return /\btitle\s*:/.test(lowered) && /\bsummary\s*:/.test(lowered) && /\brationale\s*:/.test(lowered);
 }
 
 function detectExplicitMemoryIntent(prompt: string, patterns: readonly string[], project?: string): PendingMemoryIntent | undefined {
@@ -647,12 +671,23 @@ function detectExplicitMemoryIntent(prompt: string, patterns: readonly string[],
   const matchedPattern = patterns.find((pattern) => lowered.includes(pattern.toLowerCase()));
   if (!matchedPattern) return undefined;
 
+  const policyInput = {
+    text: normalized,
+    project,
+    hasSource: looksLikeSourceOffer(normalized),
+    hasCompleteDecision: looksLikeCompleteDecisionOffer(normalized),
+    explicitImmediateWrite: looksLikeExplicitImmediateWrite(normalized),
+  };
+  const route = routeWritePolicy(policyInput);
+  const targetPath = chooseWritePolicyTarget(policyInput);
+
   return {
     createdAt: new Date().toISOString(),
     prompt: normalized,
     matchedPattern,
     project,
-    targetPath: chooseAutoProposalPath(normalized, project),
+    targetPath,
+    route: { ...route, suggestedPath: targetPath || route.suggestedPath },
   };
 }
 
@@ -689,12 +724,16 @@ function buildAutoProposalFromTurn(
     .filter(Boolean)
     .join("\n");
 
+  const policyNote = intent.route
+    ? ` Write policy: ${intent.route.contentClass} → ${intent.route.action} (${intent.route.rationale})`
+    : "";
+
   return {
     id: randomUUID().slice(0, 8),
     createdAt: new Date().toISOString(),
     project: intent.project,
     source: "auto",
-    rationale: `Auto-captured because the user explicitly asked to remember/save something (${intent.matchedPattern}).`,
+    rationale: `Auto-captured because the user explicitly asked to remember/save something (${intent.matchedPattern}).${policyNote}`,
     action: "append_file",
     path: intent.targetPath,
     title: "explicit-memory-capture",
@@ -2654,7 +2693,9 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       | undefined;
 
     if (pendingMemoryIntent && runtimeState.config?.autoPropose.enabled) {
-      systemPrompt += `\n\nExplicit memory request detected for this turn. Before finishing, create a durable memory artifact. If the request provides a local path or URL to an image, video, document, or other source, prefer memory_ingest_source. Otherwise prefer memory_propose_write over memory_write unless the user explicitly asked for an immediate write. Suggested target: ${pendingMemoryIntent.targetPath}. If the request is clearly a durable project decision with title, summary, and rationale, prefer memory_record_decision.`;
+      const route = pendingMemoryIntent.route || routeWritePolicy({ text: pendingMemoryIntent.prompt, project: pendingMemoryIntent.project });
+      const policyGuidance = buildWritePolicyGuidance(route, { targetPath: pendingMemoryIntent.targetPath });
+      systemPrompt += `\n\nExplicit memory request detected for this turn (matched: ${pendingMemoryIntent.matchedPattern}). Before finishing, create a durable memory artifact using the write-policy router. ${policyGuidance}`;
     }
 
     // Inject session core pack on first turn when configured, or as fallback if session_start inject did not land.
@@ -2861,6 +2902,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_write for wiki maintenance under memory/ instead of generic write when updating the configured Obsidian memory vault.",
       "Never use this tool for raw sources; it is only for the maintained wiki under memory/.",
+      "Safe direct Write targets: memory/log.md, working-context, active-context, progress, and session notes. Preferences, doctrine, people facts, and ambiguous glossary changes should use memory_propose_write instead.",
     ],
     parameters: MEMORY_WRITE_SCHEMA,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2912,6 +2954,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_propose_write for confirmation-first changes like durable preferences, doctrine, or uncertain long-term facts.",
       "Prefer memory_propose_write over memory_write when the update is likely correct but should still be reviewed by the user.",
+      "Write policy: preferences, doctrine, people facts, glossary naming, and uncertain durable claims default to Proposal; only chronological/progress/log/context Notes are safe for direct Write.",
     ],
     parameters: MEMORY_PROPOSE_WRITE_SCHEMA,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
