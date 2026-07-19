@@ -77,6 +77,11 @@ import {
   withSignificanceDefaults,
   type SignificanceConfig,
 } from "./significance.js";
+import {
+  formatMemoryOperatorSummary,
+  latestMetricTimestamps,
+  planAuditProposals,
+} from "./audit-proposals.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -361,6 +366,15 @@ const MEMORY_AUDIT_SCHEMA = Type.Object({
   scope: Type.Optional(StringEnum(SCOPES)),
   project: Type.Optional(Type.String({ description: "Project slug override" })),
   staleDays: Type.Optional(Type.Number({ description: "Staleness threshold in days", minimum: 1, maximum: 3650 })),
+  enqueueProposals: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true, enqueue high-signal Audit findings as review Proposals (source tag audit). Default false — report only.",
+    }),
+  ),
+  maxProposals: Type.Optional(
+    Type.Number({ description: "Max Audit Proposals to enqueue when enqueueProposals is true", minimum: 1, maximum: 50 }),
+  ),
 });
 const MEMORY_INGEST_SOURCE_SCHEMA = Type.Object({
   source: Type.String({ description: "Local file path or http(s) URL to ingest into memory" }),
@@ -3254,6 +3268,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_audit when the user asks to review, clean up, or lint the memory wiki.",
       "After memory_audit, use memory_get or memory_search only for the flagged notes that need closer inspection.",
+      "Pass enqueueProposals=true only when the user wants high-signal findings queued for review; default Audit is report-only.",
     ],
     parameters: MEMORY_AUDIT_SCHEMA,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -3266,9 +3281,39 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         const project = params.project || runtimeState.project;
         const staleDays = params.staleDays || 30;
         const summary = await runAudit(runtimeState.config, scope, project, staleDays);
+        let report = buildAuditReport(summary);
+        const enqueued: ReviewProposal[] = [];
+
+        if (params.enqueueProposals) {
+          const drafts = planAuditProposals(summary, {
+            maxProposals: params.maxProposals || 5,
+            project,
+          });
+          for (const draft of drafts) {
+            const proposal: ReviewProposal = {
+              id: randomUUID().slice(0, 8),
+              createdAt: new Date().toISOString(),
+              project,
+              source: "auto",
+              rationale: draft.rationale,
+              action: draft.action,
+              path: draft.targetPath,
+              title: draft.title,
+              content: draft.content,
+              status: "pending",
+            };
+            await queueProposal(proposal, ctx, { sourceOverride: "audit" });
+            enqueued.push(proposal);
+          }
+          report +=
+            enqueued.length > 0
+              ? `\n\nEnqueued ${enqueued.length} Audit Proposal(s): ${enqueued.map((p) => p.id).join(", ")}`
+              : "\n\nNo high-signal findings to enqueue.";
+        }
+
         return {
-          content: [{ type: "text", text: buildAuditReport(summary) }],
-          details: { summary },
+          content: [{ type: "text", text: report }],
+          details: { summary, enqueued },
         };
       });
     },
@@ -3767,7 +3812,8 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("memory-audit-now", {
-    description: "Run a deterministic memory audit: /memory-audit-now [scope] [project] [staleDays]",
+    description:
+      "Run a deterministic memory audit: /memory-audit-now [scope] [project] [staleDays] [--enqueue] [--max N]",
     handler: async (args, ctx) => {
       runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
       reviewQueue = await loadReviewQueue();
@@ -3778,14 +3824,111 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       }
 
       const parts = args.trim().split(/\s+/).filter(Boolean);
-      const scope = (parts[0] && ["project", "global", "session", "all"].includes(parts[0]) ? parts[0] : "project") as MemoryScope;
-      const project = parts[0] && ["project", "global", "session", "all"].includes(parts[0]) ? parts[1] || runtimeState.project : parts[0] || runtimeState.project;
-      const staleDaysRaw = parts[0] && ["project", "global", "session", "all"].includes(parts[0]) ? parts[2] : parts[1];
+      const enqueue = parts.includes("--enqueue");
+      const maxIdx = parts.indexOf("--max");
+      const maxProposals = maxIdx >= 0 && parts[maxIdx + 1] ? Number(parts[maxIdx + 1]) || 5 : 5;
+      const positional = parts.filter((p, i) => p !== "--enqueue" && p !== "--max" && !(maxIdx >= 0 && i === maxIdx + 1));
+      const scope = (positional[0] && ["project", "global", "session", "all"].includes(positional[0])
+        ? positional[0]
+        : "project") as MemoryScope;
+      const project =
+        positional[0] && ["project", "global", "session", "all"].includes(positional[0])
+          ? positional[1] || runtimeState.project
+          : positional[0] || runtimeState.project;
+      const staleDaysRaw =
+        positional[0] && ["project", "global", "session", "all"].includes(positional[0]) ? positional[2] : positional[1];
       const staleDays = staleDaysRaw ? Number(staleDaysRaw) || 30 : 30;
       const summary = await runAudit(runtimeState.config, scope, project, staleDays);
-      const report = buildAuditReport(summary);
-      const severity = summary.brokenLinks.length + summary.orphanCandidates.length + summary.contradictionCandidates.length > 0 ? "warning" : "info";
+      let report = buildAuditReport(summary);
+
+      if (enqueue) {
+        const drafts = planAuditProposals(summary, { maxProposals, project });
+        const ids: string[] = [];
+        for (const draft of drafts) {
+          const proposal: ReviewProposal = {
+            id: randomUUID().slice(0, 8),
+            createdAt: new Date().toISOString(),
+            project,
+            source: "auto",
+            rationale: draft.rationale,
+            action: draft.action,
+            path: draft.targetPath,
+            title: draft.title,
+            content: draft.content,
+            status: "pending",
+          };
+          await queueProposal(proposal, ctx, { sourceOverride: "audit" });
+          ids.push(proposal.id);
+        }
+        report +=
+          ids.length > 0
+            ? `\n\nEnqueued ${ids.length} Audit Proposal(s): ${ids.join(", ")}`
+            : "\n\nNo high-signal findings to enqueue.";
+      }
+
+      const severity =
+        summary.brokenLinks.length + summary.orphanCandidates.length + summary.contradictionCandidates.length > 0
+          ? "warning"
+          : "info";
       ctx.ui.notify(report, severity);
+    },
+  });
+
+  pi.registerCommand("memory-summary", {
+    description: "Operator summary: core pack, pending Proposals, QMD health, recent automation age",
+    handler: async (_args, ctx) => {
+      runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
+      reviewQueue = await loadReviewQueue();
+      updateUi(ctx);
+
+      const project = runtimeState.project || "unknown";
+      const pendingCount = getPendingReviewProposals(reviewQueue).length;
+      const events = await loadMetricEvents();
+      const automation = latestMetricTimestamps(events);
+
+      const keyNotePaths = [
+        "memory/working-context.md",
+        `memory/projects/${project}/active-context.md`,
+        `memory/projects/${project}/MEMORY.md`,
+      ];
+      const keyNotes =
+        runtimeState.ready && runtimeState.config
+          ? keyNotePaths.map((path) => {
+              try {
+                const { absolutePath } = resolveVaultFile(runtimeState.config!, path);
+                return { path, present: existsSync(absolutePath) };
+              } catch {
+                return { path, present: false };
+              }
+            })
+          : keyNotePaths.map((path) => ({ path, present: false }));
+
+      const text = formatMemoryOperatorSummary({
+        ready: runtimeState.ready,
+        project: runtimeState.project,
+        configPath: runtimeState.configPath,
+        vaultPath: runtimeState.config?.vaultPath,
+        corePack: {
+          enabled: Boolean(runtimeState.config?.coreLoad.enabled),
+          loadedCount: runtimeState.corePack?.loadedCount,
+          expectedCount: runtimeState.corePack?.files.length,
+          truncated: runtimeState.corePack?.truncated,
+          injected: runtimeState.corePackInjected,
+          missingPaths: runtimeState.corePack?.missingPaths,
+        },
+        pendingProposalCount: pendingCount,
+        qmd: {
+          enabled: runtimeState.config?.qmdSync.enabled,
+          dirty: Boolean(qmdDirtyAt),
+          syncing: qmdSyncing,
+          lastError: qmdLastError,
+          dirtyAgeMs: qmdDirtyAt ? Date.now() - qmdDirtyAt : undefined,
+        },
+        metrics: automation,
+        keyNotes,
+      });
+
+      ctx.ui.notify(text, runtimeState.ready ? "info" : "warning");
     },
   });
 

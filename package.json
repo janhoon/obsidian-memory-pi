@@ -5,7 +5,7 @@
   "keywords": ["pi-package", "obsidian", "memory", "qmd", "docling"],
   "description": "Markdown-first Obsidian memory package for Pi with QMD-backed retrieval and Docling source ingest.",
   "scripts": {
-    "test": "node --experimental-strip-types extensions/obsidian-memory/qmd-sync-policy.test.mjs && node --experimental-strip-types extensions/obsidian-memory/core-pack.test.mjs && node --experimental-strip-types extensions/obsidian-memory/write-policy.test.mjs && node --experimental-strip-types extensions/obsidian-memory/metrics.test.mjs && node --experimental-strip-types extensions/obsidian-memory/decisions.test.mjs && node --experimental-strip-types extensions/obsidian-memory/auto-recall.test.mjs && node --experimental-strip-types extensions/obsidian-memory/significance.test.mjs",
+    "test": "node --experimental-strip-types extensions/obsidian-memory/qmd-sync-policy.test.mjs && node --experimental-strip-types extensions/obsidian-memory/core-pack.test.mjs && node --experimental-strip-types extensions/obsidian-memory/write-policy.test.mjs && node --experimental-strip-types extensions/obsidian-memory/metrics.test.mjs && node --experimental-strip-types extensions/obsidian-memory/decisions.test.mjs && node --experimental-strip-types extensions/obsidian-memory/auto-recall.test.mjs && node --experimental-strip-types extensions/obsidian-memory/significance.test.mjs && node --experimental-strip-types extensions/obsidian-memory/audit-proposals.test.mjs",
     "qmd:sync": "bash scripts/qmd-memory-sync.sh",
     "qmd:update": "bash scripts/qmd-memory-sync.sh --no-embed",
     "qmd:status": "bash scripts/qmd-memory-sync.sh --status-only"

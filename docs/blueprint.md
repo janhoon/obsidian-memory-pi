@@ -46,6 +46,7 @@ Responsibilities:
 - expose operator commands:
   - `/memory-status`
   - `/memory-metrics`
+  - `/memory-summary`
   - `/memory-search <query>`
   - `/memory-review [list|show|pick|apply|discard] [id|next|all]`
   - `/memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]`
