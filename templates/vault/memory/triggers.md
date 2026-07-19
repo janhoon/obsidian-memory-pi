@@ -8,13 +8,17 @@ last_reviewed: 2026-04-15
 
 ## Loading triggers
 
-Load project memory when the conversation includes:
+Auto-recall classifies intent and Searches the matching Scope mix (snippets only):
 
-- continue / catch up / last session
-- what did we decide
-- why did we do this
-- project status
-- architecture or system pattern questions
+| Intent | Example phrases | Scopes |
+| --- | --- | --- |
+| Continuity | continue / catch up / last session | session + project |
+| Decision lookup | what did we decide / why did we | project + global |
+| Preference lookup | my preference / I prefer | global + project |
+| Status | project status / what's next | project (prefer Active context) |
+| General (legacy patterns) | remember / context | project |
+
+Optional: `autoRecall.firstTurnRecall` runs a light status-oriented Recall on the first turn even without a trigger phrase (on top of the core pack).
 
 ### Session core pack (always-on, budgeted)
 

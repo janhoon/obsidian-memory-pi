@@ -28,6 +28,7 @@
     "maxResults": 4,
     "timeoutMs": 60000,
     "clearDelayMs": 5000,
+    "firstTurnRecall": false,
     "triggerPatterns": [
       "continue",
       "last session",

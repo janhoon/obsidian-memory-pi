@@ -63,6 +63,12 @@ import {
   sanitizeDecisionTitle,
   upsertDecisionIndexEntry,
 } from "./decisions.js";
+import {
+  buildRecallScopePrefixes,
+  planAutoRecall,
+  rankRecallResults,
+  type AutoRecallPlan,
+} from "./auto-recall.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -108,6 +114,8 @@ type MemoryConfig = {
     timeoutMs: number;
     clearDelayMs: number;
     triggerPatterns: string[];
+    /** Light first-turn Recall without requiring a trigger phrase (status-oriented). */
+    firstTurnRecall: boolean;
   };
   coreLoad: CoreLoadConfig;
   autoSessionNotes: {
@@ -429,6 +437,7 @@ function buildDefaultConfigExample(): string {
       timeoutMs: DEFAULT_AUTO_RECALL_TIMEOUT_MS,
       clearDelayMs: DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS,
       triggerPatterns: [...DEFAULT_AUTO_RECALL_PATTERNS],
+      firstTurnRecall: false,
     },
     coreLoad: { ...DEFAULT_CORE_LOAD_CONFIG, files: [...DEFAULT_CORE_LOAD_CONFIG.files] },
     autoSessionNotes: {
@@ -492,6 +501,7 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
           ? config.autoRecall?.clearDelayMs ?? DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS
           : DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS,
       triggerPatterns: config.autoRecall?.triggerPatterns || [...DEFAULT_AUTO_RECALL_PATTERNS],
+      firstTurnRecall: config.autoRecall?.firstTurnRecall ?? false,
     },
     coreLoad: withCoreLoadDefaults(config.coreLoad),
     autoSessionNotes: {
@@ -1022,6 +1032,7 @@ function renderStatus(
     `Default mode: ${state.config?.defaultSearchMode || "hybrid"}`,
     `Pending review items: ${pendingReviewCount}`,
     `Auto recall: ${state.config?.autoRecall.enabled ? "on" : "off"}`,
+    `Auto recall first-turn: ${state.config?.autoRecall.firstTurnRecall ? "on" : "off"}`,
     `Auto recall timeout: ${state.config?.autoRecall.timeoutMs ?? DEFAULT_AUTO_RECALL_TIMEOUT_MS}ms`,
     `Memory activity clear delay: ${state.config?.autoRecall.clearDelayMs ?? DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS}ms`,
     `Core pack: ${state.config?.coreLoad.enabled ? "on" : "off"}`,
@@ -1133,14 +1144,26 @@ function buildQmdArgs(config: MemoryConfig, query: string, mode: SearchMode, lim
 async function runSearch(
   pi: ExtensionAPI,
   state: RuntimeState,
-  options: { query: string; scope: MemoryScope; mode: SearchMode; limit: number; project?: string; timeoutMs?: number },
+  options: {
+    query: string;
+    scope: MemoryScope;
+    mode: SearchMode;
+    limit: number;
+    project?: string;
+    timeoutMs?: number;
+    /** When set, use these path prefixes instead of tool scope nesting. */
+    pathPrefixes?: string[];
+  },
 ): Promise<{ results: QmdSearchResult[]; attemptedModes: SearchMode[] }> {
   if (!state.ready || !state.config) {
     throw new Error("Memory system is not configured.");
   }
 
   const project = options.project || state.project;
-  const prefixes = getScopePrefixes(state.config, options.scope, project);
+  const prefixes =
+    options.pathPrefixes !== undefined
+      ? options.pathPrefixes
+      : getScopePrefixes(state.config, options.scope, project);
   const rawLimit = Math.min(Math.max(options.limit * 4, options.limit), 30);
   const attemptedModes: SearchMode[] = [];
   let lastError = "Unknown QMD error";
@@ -1168,6 +1191,42 @@ async function runSearch(
   }
 
   throw new Error(lastError);
+}
+
+async function runAutoRecallSearch(
+  pi: ExtensionAPI,
+  state: RuntimeState,
+  plan: AutoRecallPlan,
+  options: { query: string; mode: SearchMode; limit: number; timeoutMs?: number },
+): Promise<{ results: QmdSearchResult[]; attemptedModes: SearchMode[]; plan: AutoRecallPlan }> {
+  if (!state.ready || !state.config) {
+    throw new Error("Memory system is not configured.");
+  }
+
+  const pathPrefixes = buildRecallScopePrefixes(plan.scopes, {
+    globalPrefixes: state.config.scopePrefixes.global,
+    projectTemplate: state.config.scopePrefixes.projectTemplate,
+    sessionTemplate: state.config.scopePrefixes.sessionTemplate,
+    project: state.project,
+  });
+
+  // Empty prefixes (e.g. no project slug) → skip rather than search everything.
+  if (pathPrefixes.length === 0) {
+    return { results: [], attemptedModes: [], plan };
+  }
+
+  const overFetch = Math.min(Math.max(options.limit * 3, options.limit), 20);
+  const { results, attemptedModes } = await runSearch(pi, state, {
+    query: options.query,
+    scope: "project", // ignored when pathPrefixes is set
+    mode: options.mode,
+    limit: overFetch,
+    timeoutMs: options.timeoutMs,
+    pathPrefixes,
+  });
+
+  const ranked = rankRecallResults(results, plan.preferPathSubstrings).slice(0, options.limit);
+  return { results: ranked, attemptedModes, plan };
 }
 
 function isTimeoutError(error: unknown): boolean {
@@ -2287,10 +2346,25 @@ async function applyReviewProposal(config: MemoryConfig, proposal: ReviewProposa
   await writeVaultFile(config, path, proposal.content, proposal.action === "append_file");
 }
 
-function shouldAutoRecall(prompt: string, state: RuntimeState): boolean {
-  if (!state.ready || !state.config?.autoRecall.enabled) return false;
-  const lowered = prompt.toLowerCase();
-  return state.config.autoRecall.triggerPatterns.some((pattern) => lowered.includes(pattern.toLowerCase()));
+function planSessionAutoRecall(
+  prompt: string,
+  state: RuntimeState,
+  options: { isFirstTurn?: boolean } = {},
+): AutoRecallPlan {
+  if (!state.ready || !state.config) {
+    return {
+      shouldRecall: false,
+      intent: "none",
+      scopes: [],
+      preferPathSubstrings: [],
+      reason: "not ready",
+    };
+  }
+  return planAutoRecall(prompt, {
+    config: state.config.autoRecall,
+    project: state.project,
+    isFirstTurn: options.isFirstTurn,
+  });
 }
 
 export default function obsidianMemoryPackage(pi: ExtensionAPI) {
@@ -2299,6 +2373,8 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     ready: false,
     warnings: [],
   };
+  /** True until the first before_agent_start of a new/forked/startup session completes planning. */
+  let firstAgentTurnPending = false;
   let reviewQueue: ReviewProposal[] = [];
   let pendingMemoryIntent: PendingMemoryIntent | undefined;
   let memoryActivity: MemoryActivity | undefined;
@@ -2588,10 +2664,14 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     if (event.reason === "startup" || event.reason === "new" || event.reason === "fork") {
       runtimeState.corePack = undefined;
       runtimeState.corePackInjected = false;
+      firstAgentTurnPending = true;
     } else if (event.reason === "resume") {
       runtimeState.corePack = undefined;
       // Avoid duplicating core pack messages already present in resumed history.
       runtimeState.corePackInjected = true;
+      firstAgentTurnPending = false;
+    } else if (event.reason === "reload") {
+      // Keep first-turn flag as-is for reload mid-session.
     }
 
     if (runtimeState.ready && runtimeState.config?.coreLoad.enabled) {
@@ -2778,12 +2858,15 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       }
     }
 
-    if (shouldAutoRecall(event.prompt, runtimeState) && runtimeState.config) {
+    const isFirstTurn = firstAgentTurnPending;
+    firstAgentTurnPending = false;
+    const recallPlan = planSessionAutoRecall(event.prompt, runtimeState, { isFirstTurn });
+
+    if (recallPlan.shouldRecall && runtimeState.config) {
       const activityId = beginMemoryActivity(ctx, "recalling memory: searching QMD");
       try {
-        const { results } = await runSearch(pi, runtimeState, {
+        const { results } = await runAutoRecallSearch(pi, runtimeState, recallPlan, {
           query: event.prompt,
-          scope: "project",
           mode: runtimeState.config.defaultSearchMode,
           limit: runtimeState.config.autoRecall.maxResults,
           timeoutMs: runtimeState.config.autoRecall.timeoutMs,
@@ -2792,7 +2875,8 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         if (results.length > 0) {
           const preview = summarizeResults(results);
           runtimeState.lastRecallPreview = preview;
-          const recallContent = `Auto memory recall for project \`${runtimeState.project || "unknown"}\`:\n\n${preview}`;
+          const scopeLabel = recallPlan.scopes.join("+") || "project";
+          const recallContent = `Auto memory recall for project \`${runtimeState.project || "unknown"}\` (intent: ${recallPlan.intent}, scopes: ${scopeLabel}) — snippets only; use memory_get for full Notes:\n\n${preview}`;
           if (message) {
             // Core pack already claimed the single injectable message; fold recall into the system prompt.
             systemPrompt += `\n\n${recallContent}`;
@@ -2803,7 +2887,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
               display: true,
             };
           }
-          systemPrompt += "\n\nWhen obsidian-memory-context is present, treat it as retrieved memory context. Use memory_get before relying on a note beyond the quoted snippet.";
+          systemPrompt += "\n\nWhen obsidian-memory-context is present, treat it as retrieved memory context (snippets only). Use memory_get before relying on a note beyond the quoted snippet.";
         }
         void appendMetricEvent(
           createAutoRecallEvent({
