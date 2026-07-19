@@ -13,6 +13,19 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
+  assembleCorePack,
+  corePackCustomType,
+  formatCorePackWidgetLabel,
+  resolveCorePackPaths,
+  shouldInjectCorePackOnFirstTurn,
+  shouldInjectCorePackOnSessionStart,
+  withCoreLoadDefaults,
+  type CoreLoadConfig,
+  type CorePackResult,
+  type CorePackSource,
+  DEFAULT_CORE_LOAD_CONFIG,
+} from "./core-pack.js";
+import {
   formatQmdIndexWidgetLabel,
   shouldClearDirtyAfterSync,
   shouldIncludeEmbedForDebouncedSync,
@@ -67,6 +80,7 @@ type MemoryConfig = {
     clearDelayMs: number;
     triggerPatterns: string[];
   };
+  coreLoad: CoreLoadConfig;
   autoSessionNotes: {
     enabled: boolean;
     maxAssistantChars: number;
@@ -106,6 +120,10 @@ type RuntimeState = {
   ready: boolean;
   warnings: string[];
   lastRecallPreview?: string;
+  /** Last assembled session core pack (Working / Active context, optional MEMORY index). */
+  corePack?: CorePackResult;
+  /** True after the core pack message was injected into this session. */
+  corePackInjected?: boolean;
 };
 
 type QmdSearchResult = {
@@ -375,6 +393,7 @@ function buildDefaultConfigExample(): string {
       clearDelayMs: DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS,
       triggerPatterns: [...DEFAULT_AUTO_RECALL_PATTERNS],
     },
+    coreLoad: { ...DEFAULT_CORE_LOAD_CONFIG, files: [...DEFAULT_CORE_LOAD_CONFIG.files] },
     autoSessionNotes: {
       enabled: DEFAULT_AUTO_SESSION_NOTES.enabled,
       maxAssistantChars: DEFAULT_AUTO_SESSION_NOTES.maxAssistantChars,
@@ -437,6 +456,7 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
           : DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS,
       triggerPatterns: config.autoRecall?.triggerPatterns || [...DEFAULT_AUTO_RECALL_PATTERNS],
     },
+    coreLoad: withCoreLoadDefaults(config.coreLoad),
     autoSessionNotes: {
       enabled: config.autoSessionNotes?.enabled ?? DEFAULT_AUTO_SESSION_NOTES.enabled,
       maxAssistantChars: config.autoSessionNotes?.maxAssistantChars || DEFAULT_AUTO_SESSION_NOTES.maxAssistantChars,
@@ -567,6 +587,9 @@ async function refreshRuntimeState(pi: ExtensionAPI, ctx: ExtensionContext, curr
     warnings,
     ready: false,
     lastRecallPreview: current?.lastRecallPreview,
+    // Keep session core pack across config reloads until we rebuild it.
+    corePack: current?.corePack,
+    corePackInjected: current?.corePackInjected,
   };
   next.ready = isRuntimeReady(next);
   return next;
@@ -779,7 +802,18 @@ function buildWidgetLines(
   const review = ctx.ui.theme.fg(pending.length > 0 ? "warning" : "dim", `review ${pending.length} pending`);
   const notes = ctx.ui.theme.fg(sessionNotesEnabled ? "success" : "dim", `session notes ${sessionNotesEnabled ? "on" : "off"}`);
   const autoCapture = ctx.ui.theme.fg(state.config?.autoPropose.enabled ? "success" : "dim", `auto capture ${state.config?.autoPropose.enabled ? "on" : "off"}`);
-  const lines = [ctx.ui.theme.fg("accent", "🧠 memory"), `${review} · ${notes} · ${autoCapture}`];
+  const coreEnabled = state.config?.coreLoad.enabled ?? DEFAULT_CORE_LOAD_CONFIG.enabled;
+  const coreLabel = formatCorePackWidgetLabel(state.corePack, { enabled: coreEnabled });
+  const core = coreLabel
+    ? ctx.ui.theme.fg(
+        !coreEnabled || state.corePack?.loadedCount === 0 ? "dim" : state.corePack?.truncated ? "warning" : "success",
+        coreLabel,
+      )
+    : undefined;
+  const lines = [
+    ctx.ui.theme.fg("accent", "🧠 memory"),
+    core ? `${review} · ${notes} · ${autoCapture} · ${core}` : `${review} · ${notes} · ${autoCapture}`,
+  ];
 
   if (activity) {
     const color = activity.state === "complete" ? "success" : activity.state === "running" ? "accent" : "warning";
@@ -791,6 +825,15 @@ function buildWidgetLines(
   if (qmdLabel) {
     const color = qmdIndex?.syncing ? "accent" : "warning";
     lines.push(ctx.ui.theme.fg(color, qmdLabel));
+  }
+
+  if (state.corePack && coreEnabled) {
+    const missing = state.corePack.missingPaths;
+    if (missing.length > 0 && state.corePack.loadedCount > 0) {
+      lines.push(ctx.ui.theme.fg("dim", `core missing: ${missing.map((p) => basename(p)).join(", ")}`));
+    } else if (state.corePack.loadedCount === 0 && state.corePack.files.length > 0) {
+      lines.push(ctx.ui.theme.fg("dim", "core pack: no Notes found"));
+    }
   }
 
   if (pending.length > 0) {
@@ -825,7 +868,10 @@ function setStatus(
     const pendingReviewCount = getPendingReviewProposals(pendingQueue).length;
     const suffix = pendingReviewCount > 0 ? ` +${pendingReviewCount} review` : "";
     const qmdSuffix = qmdIndex?.syncing ? " · qmd syncing" : qmdIndex?.dirty ? " · qmd stale" : "";
-    ctx.ui.setStatus("obsidian-memory", `memory:${state.project || "unknown"}${suffix}${qmdSuffix}`);
+    const coreEnabled = state.config?.coreLoad.enabled ?? DEFAULT_CORE_LOAD_CONFIG.enabled;
+    const coreLabel = formatCorePackWidgetLabel(state.corePack, { enabled: coreEnabled });
+    const coreSuffix = coreLabel ? ` · ${coreLabel}` : "";
+    ctx.ui.setStatus("obsidian-memory", `memory:${state.project || "unknown"}${suffix}${qmdSuffix}${coreSuffix}`);
     ctx.ui.setWidget("obsidian-memory", buildWidgetLines(ctx, state, pendingQueue, sessionNotesEnabled, pendingIntent, activity, qmdIndex), {
       placement: "belowEditor",
     });
@@ -853,6 +899,16 @@ function renderStatus(state: RuntimeState, qmdStatus?: string, pendingReviewCoun
     `Auto recall: ${state.config?.autoRecall.enabled ? "on" : "off"}`,
     `Auto recall timeout: ${state.config?.autoRecall.timeoutMs ?? DEFAULT_AUTO_RECALL_TIMEOUT_MS}ms`,
     `Memory activity clear delay: ${state.config?.autoRecall.clearDelayMs ?? DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS}ms`,
+    `Core pack: ${state.config?.coreLoad.enabled ? "on" : "off"}`,
+    `Core pack inject: ${state.config?.coreLoad.injectOn || DEFAULT_CORE_LOAD_CONFIG.injectOn}`,
+    `Core pack budget: ${state.config?.coreLoad.maxFileChars ?? DEFAULT_CORE_LOAD_CONFIG.maxFileChars} / ${state.config?.coreLoad.maxTotalChars ?? DEFAULT_CORE_LOAD_CONFIG.maxTotalChars} chars`,
+    `Core pack loaded: ${
+      state.corePack
+        ? `${state.corePack.loadedCount}/${state.corePack.files.length} notes (${state.corePack.totalChars} chars${state.corePack.truncated ? ", truncated" : ""})${state.corePackInjected ? ", injected" : ", pending inject"}`
+        : state.config?.coreLoad.enabled
+          ? "not loaded yet"
+          : "disabled"
+    }`,
     `Auto session notes: ${state.config?.autoSessionNotes.enabled ? "on" : "off"}`,
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
@@ -1016,6 +1072,36 @@ async function readVaultFile(config: MemoryConfig, inputPath: string, offset?: n
   const start = offset ? Math.max(0, offset - 1) : 0;
   const end = limit ? start + limit : lines.length;
   return lines.slice(start, end).join("\n");
+}
+
+/**
+ * Load the session-start core pack (Working context, Active context, optional MEMORY index).
+ * Missing Notes are skipped quietly; budgets truncate rather than fail.
+ */
+async function loadCorePack(config: MemoryConfig, project: string): Promise<CorePackResult> {
+  const coreLoad = config.coreLoad;
+  const paths = resolveCorePackPaths(coreLoad.files, project);
+  const sources: CorePackSource[] = [];
+
+  for (const relativePath of paths) {
+    try {
+      const { absolutePath } = resolveVaultFile(config, relativePath);
+      if (!existsSync(absolutePath)) {
+        sources.push({ path: relativePath, content: undefined });
+        continue;
+      }
+      const content = await readFile(absolutePath, "utf8");
+      sources.push({ path: relativePath, content });
+    } catch {
+      sources.push({ path: relativePath, content: undefined });
+    }
+  }
+
+  return assembleCorePack(sources, {
+    project,
+    maxFileChars: coreLoad.maxFileChars,
+    maxTotalChars: coreLoad.maxTotalChars,
+  });
 }
 
 async function writeVaultFile(config: MemoryConfig, inputPath: string, content: string, appendMode: boolean) {
@@ -2416,6 +2502,56 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     pendingMemoryIntent = undefined;
     clearScheduledMemoryActivity();
     memoryActivity = undefined;
+
+    // Fresh sessions rebuild and may inject the core pack.
+    // Reloads keep injection state. Resumes rebuild for widget/status but do not re-inject.
+    if (event.reason === "startup" || event.reason === "new" || event.reason === "fork") {
+      runtimeState.corePack = undefined;
+      runtimeState.corePackInjected = false;
+    } else if (event.reason === "resume") {
+      runtimeState.corePack = undefined;
+      // Avoid duplicating core pack messages already present in resumed history.
+      runtimeState.corePackInjected = true;
+    }
+
+    if (runtimeState.ready && runtimeState.config?.coreLoad.enabled) {
+      try {
+        runtimeState.corePack = await loadCorePack(runtimeState.config, runtimeState.project || "unknown");
+      } catch {
+        // Core pack is best-effort; never break session start.
+        runtimeState.corePack = undefined;
+      }
+
+      if (
+        runtimeState.corePack?.messageContent &&
+        shouldInjectCorePackOnSessionStart(event.reason, runtimeState.config.coreLoad.injectOn, Boolean(runtimeState.corePackInjected))
+      ) {
+        try {
+          pi.sendMessage(
+            {
+              customType: corePackCustomType(),
+              content: runtimeState.corePack.messageContent,
+              display: true,
+              details: {
+                project: runtimeState.project,
+                loadedCount: runtimeState.corePack.loadedCount,
+                missingPaths: runtimeState.corePack.missingPaths,
+                totalChars: runtimeState.corePack.totalChars,
+                truncated: runtimeState.corePack.truncated,
+              },
+            },
+            { deliverAs: "nextTurn" },
+          );
+          runtimeState.corePackInjected = true;
+        } catch {
+          // If injection fails, first-turn path (when configured) or later turns can retry via before_agent_start.
+        }
+      }
+    } else if (!runtimeState.config?.coreLoad.enabled) {
+      runtimeState.corePack = undefined;
+      runtimeState.corePackInjected = false;
+    }
+
     updateUi(ctx);
 
     if (runtimeState.ready && runtimeState.config?.autoSessionNotes.enabled && event.reason !== "reload") {
@@ -2431,7 +2567,11 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
 
     if (ctx.hasUI) {
       if (runtimeState.ready) {
-        ctx.ui.notify(`Obsidian memory ready for project: ${runtimeState.project}`, "info");
+        const coreHint =
+          runtimeState.config?.coreLoad.enabled && runtimeState.corePack
+            ? ` · core ${runtimeState.corePack.loadedCount}/${runtimeState.corePack.files.length}`
+            : "";
+        ctx.ui.notify(`Obsidian memory ready for project: ${runtimeState.project}${coreHint}`, "info");
       } else {
         ctx.ui.notify(`Obsidian memory not ready. Run /memory-init-config or edit ${runtimeState.configPath}`, "warning");
       }
@@ -2509,11 +2649,47 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           customType: string;
           content: string;
           display: boolean;
+          details?: unknown;
         }
       | undefined;
 
     if (pendingMemoryIntent && runtimeState.config?.autoPropose.enabled) {
       systemPrompt += `\n\nExplicit memory request detected for this turn. Before finishing, create a durable memory artifact. If the request provides a local path or URL to an image, video, document, or other source, prefer memory_ingest_source. Otherwise prefer memory_propose_write over memory_write unless the user explicitly asked for an immediate write. Suggested target: ${pendingMemoryIntent.targetPath}. If the request is clearly a durable project decision with title, summary, and rationale, prefer memory_record_decision.`;
+    }
+
+    // Inject session core pack on first turn when configured, or as fallback if session_start inject did not land.
+    if (
+      runtimeState.ready &&
+      runtimeState.config?.coreLoad.enabled &&
+      !runtimeState.corePackInjected &&
+      (shouldInjectCorePackOnFirstTurn(runtimeState.config.coreLoad.injectOn, false) ||
+        runtimeState.config.coreLoad.injectOn === "session_start")
+    ) {
+      try {
+        if (!runtimeState.corePack) {
+          runtimeState.corePack = await loadCorePack(runtimeState.config, runtimeState.project || "unknown");
+        }
+        if (runtimeState.corePack.messageContent) {
+          message = {
+            customType: corePackCustomType(),
+            content: runtimeState.corePack.messageContent,
+            display: true,
+            details: {
+              project: runtimeState.project,
+              loadedCount: runtimeState.corePack.loadedCount,
+              missingPaths: runtimeState.corePack.missingPaths,
+              totalChars: runtimeState.corePack.totalChars,
+              truncated: runtimeState.corePack.truncated,
+            },
+          };
+          runtimeState.corePackInjected = true;
+          systemPrompt +=
+            "\n\nWhen obsidian-memory-core is present, treat it as always-on Working/Active context. Prefer it for project focus before Auto-recall snippets. Use memory_get only when you need more than the core pack shows.";
+          updateUi(ctx);
+        }
+      } catch {
+        // Core pack is best-effort.
+      }
     }
 
     if (shouldAutoRecall(event.prompt, runtimeState) && runtimeState.config) {
@@ -2530,11 +2706,17 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         if (results.length > 0) {
           const preview = summarizeResults(results);
           runtimeState.lastRecallPreview = preview;
-          message = {
-            customType: "obsidian-memory-context",
-            content: `Auto memory recall for project \`${runtimeState.project || "unknown"}\`:\n\n${preview}`,
-            display: true,
-          };
+          const recallContent = `Auto memory recall for project \`${runtimeState.project || "unknown"}\`:\n\n${preview}`;
+          if (message) {
+            // Core pack already claimed the single injectable message; fold recall into the system prompt.
+            systemPrompt += `\n\n${recallContent}`;
+          } else {
+            message = {
+              customType: "obsidian-memory-context",
+              content: recallContent,
+              display: true,
+            };
+          }
           systemPrompt += "\n\nWhen obsidian-memory-context is present, treat it as retrieved memory context. Use memory_get before relying on a note beyond the quoted snippet.";
         }
         finishMemoryActivity(ctx, activityId, "complete", "memory recall complete");
@@ -3283,6 +3465,16 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
       reviewQueue = await loadReviewQueue();
+      // Rebuild core pack contents for status/widget; do not re-inject into an existing conversation.
+      if (runtimeState.ready && runtimeState.config?.coreLoad.enabled) {
+        try {
+          runtimeState.corePack = await loadCorePack(runtimeState.config, runtimeState.project || "unknown");
+        } catch {
+          // keep prior corePack if rebuild fails
+        }
+      } else if (!runtimeState.config?.coreLoad.enabled) {
+        runtimeState.corePack = undefined;
+      }
       updateUi(ctx);
       ctx.ui.notify(renderStatus(runtimeState, undefined, getPendingReviewProposals(reviewQueue).length), runtimeState.ready ? "success" : "warning");
     },

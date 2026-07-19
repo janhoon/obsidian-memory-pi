@@ -29,6 +29,7 @@ This package is the first implementation pass. It currently provides:
   - `/memory-init-config`
   - `/memory-reload`
   - automatic pre-answer memory recall heuristics via `before_agent_start`
+  - session-start core pack injection of Working context, Active context, and optional project MEMORY index (`coreLoad` config; character budgets; widget/status indicator)
   - below-editor memory activity indicators for recall, reads, searches, writes, review, and audit operations
   - configurable auto-recall timeout / activity-clear delay under `autoRecall.timeoutMs` and `autoRecall.clearDelayMs`
   - debounced QMD dirty sync after durable wiki writes (`qmdSync` config) with widget stale/syncing states
@@ -107,6 +108,8 @@ templates/config.example.json
 `/memory-init-config` copies that template to `~/.pi/agent/memory/config.json` (or writes built-in defaults if the package template is unavailable).
 
 Automatic recall uses `autoRecall.timeoutMs` (default `60000`) and `autoRecall.clearDelayMs` (default `5000`) when those fields are omitted from config.
+
+Session-start core pack uses `coreLoad` (`enabled`, `maxTotalChars`, `maxFileChars`, `files`, `injectOn`). Defaults load Working context, project Active context, and optional `MEMORY.md` under a 14k total / 6k per-file character budget. Set `coreLoad.enabled` to `false` to disable.
 
 Media/source ingest uses Docling as an external command. By default the extension runs `docling` and `ffmpeg` from `PATH`; override these under `ingest.doclingCommand` and `ingest.ffmpegCommand` if you use wrappers such as `uvx docling`. `memory_ingest_source` and `/memory-ingest` accept local paths and `http(s)` URLs, write generated notes directly under `memory/projects/<project>/ingests/`, store raw/derived artifacts under `sources/media/`, and refresh QMD by default.
 

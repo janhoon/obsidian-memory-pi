@@ -39,6 +39,18 @@
       "project status"
     ]
   },
+  "coreLoad": {
+    "enabled": true,
+    "maxTotalChars": 14000,
+    "maxFileChars": 6000,
+    "files": [
+      "memory/working-context.md",
+      "memory/projects/{project}/active-context.md",
+      "memory/projects/{project}/MEMORY.md"
+    ],
+    "includeTodaySessionTail": false,
+    "injectOn": "session_start"
+  },
   "autoSessionNotes": {
     "enabled": true,
     "maxAssistantChars": 280,

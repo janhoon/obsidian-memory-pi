@@ -80,6 +80,7 @@ Starter markdown files for the canonical wiki layout.
 - detect project slug
 - set status line / widget
 - surface misconfiguration clearly
+- load and inject the bounded core pack (Working context, Active context, optional project MEMORY index) when `coreLoad` is enabled
 - append a session-start marker to today's session note
 
 ### `before_agent_start`
