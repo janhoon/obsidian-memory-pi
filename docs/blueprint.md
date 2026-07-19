@@ -41,6 +41,7 @@ Responsibilities:
 - write automatic session summaries under `memory/sessions/<project>/YYYY-MM-DD.md`
 - auto-queue review proposals when the user explicitly says things like `remember this` or `save this`
 - significance extract: high-signal turns (decision / preference / correction / milestone) without a memory tool enqueue capped review-only Proposals (source tag `extract`; kill-switch via discard-rate metrics)
+- optional idle Dream: after configured idle minutes + session turn threshold, run one automatic Dream (never mid-turn; fully disable-able; does not affect `/memory-dream`)
 - route memory intent through a write-policy matrix (Write vs Proposal vs Decision vs Ingest) encoded in runtime helpers
 - flush a compact session snapshot before Pi compacts context
 - expose operator commands:

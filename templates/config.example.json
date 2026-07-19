@@ -83,6 +83,12 @@
     "maxContextChars": 4000,
     "maxProposals": 5
   },
+  "dreamIdle": {
+    "enabled": false,
+    "idleMinutes": 30,
+    "minSessionTurns": 3,
+    "checkIntervalMs": 60000
+  },
   "preCompactionFlush": {
     "enabled": true,
     "maxTurns": 8,

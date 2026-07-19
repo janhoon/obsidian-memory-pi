@@ -89,6 +89,18 @@ import {
   withDreamDefaults,
   type DreamConfig,
 } from "./dream.js";
+import {
+  createDreamIdleState,
+  evaluateDreamIdleTrigger,
+  markAutoDreamRan,
+  markDreamIdleAgentEnd,
+  markDreamIdleAgentStart,
+  maybeRearmAutoDream,
+  noteDreamIdleActivity,
+  withDreamIdleDefaults,
+  type DreamIdleConfig,
+  type DreamIdleState,
+} from "./dream-idle.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -151,6 +163,8 @@ type MemoryConfig = {
   significanceCapture: SignificanceConfig;
   /** Manual Dream consolidation (Session notes → Wiki + Proposals). */
   dream: DreamConfig;
+  /** Idle / scheduled Dream trigger (does not affect manual /memory-dream). */
+  dreamIdle: DreamIdleConfig;
   preCompactionFlush: {
     enabled: boolean;
     maxTurns: number;
@@ -484,6 +498,7 @@ function buildDefaultConfigExample(): string {
     },
     significanceCapture: withSignificanceDefaults(),
     dream: withDreamDefaults(),
+    dreamIdle: withDreamIdleDefaults(),
     preCompactionFlush: {
       enabled: DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
@@ -550,6 +565,7 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
     },
     significanceCapture: withSignificanceDefaults(config.significanceCapture),
     dream: withDreamDefaults(config.dream),
+    dreamIdle: withDreamIdleDefaults(config.dreamIdle),
     preCompactionFlush: {
       enabled: config.preCompactionFlush?.enabled ?? DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: config.preCompactionFlush?.maxTurns || DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
@@ -1086,6 +1102,7 @@ function renderStatus(
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
     `Significance extract: ${state.config?.significanceCapture.enabled ? `on (max ${state.config.significanceCapture.maxProposalsPerTurn}/turn)` : "off"}${state.config?.significanceCapture.disabledByDiscardRate ? " · kill-switch" : ""}`,
     `Dream lookback: ${state.config?.dream.lookbackDays ?? 3}d · max proposals ${state.config?.dream.maxProposals ?? 5}`,
+    `Idle Dream: ${state.config?.dreamIdle?.enabled ? `on · ${state.config.dreamIdle.idleMinutes}m idle · ≥${state.config.dreamIdle.minSessionTurns} turns` : "off"}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
     `QMD auto-sync: ${state.config?.qmdSync.enabled ? "on" : "off"}`,
     `QMD sync mode: ${state.config?.qmdSync.mode || DEFAULT_QMD_SYNC_CONFIG.mode}`,
@@ -2414,6 +2431,9 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   };
   /** True until the first before_agent_start of a new/forked/startup session completes planning. */
   let firstAgentTurnPending = false;
+  let dreamIdleState: DreamIdleState = createDreamIdleState();
+  let dreamIdleTimer: ReturnType<typeof setInterval> | undefined;
+  let dreamIdleRunning = false;
   let reviewQueue: ReviewProposal[] = [];
   let pendingMemoryIntent: PendingMemoryIntent | undefined;
   let memoryActivity: MemoryActivity | undefined;
@@ -2663,9 +2683,144 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     return proposal;
   };
 
+  const clearDreamIdleTimer = () => {
+    if (dreamIdleTimer) {
+      clearInterval(dreamIdleTimer);
+      dreamIdleTimer = undefined;
+    }
+  };
+
+  const runDreamPassNow = async (
+    options: { lookbackDays?: number; mode: "manual" | "idle"; ctx?: ExtensionContext } = { mode: "manual" },
+  ): Promise<{ summary: string; proposalIds: string[]; wikiMutated: boolean }> => {
+    if (!runtimeState.ready || !runtimeState.config) {
+      throw new Error("Memory system is not configured.");
+    }
+
+    const project = runtimeState.project || "unknown";
+    const dreamConfig = withDreamDefaults(runtimeState.config.dream);
+    const lookbackDays =
+      options.lookbackDays && options.lookbackDays > 0 ? options.lookbackDays : dreamConfig.lookbackDays;
+    const dates = dreamLookbackDates(lookbackDays);
+
+    const sessionNotes: Array<{ path: string; content: string }> = [];
+    for (const date of dates) {
+      const path = sessionNotePath(project, date);
+      try {
+        const { absolutePath } = resolveVaultFile(runtimeState.config, path);
+        if (!existsSync(absolutePath)) continue;
+        const content = await readFile(absolutePath, "utf8");
+        sessionNotes.push({ path, content });
+      } catch {
+        // skip unreadable session notes
+      }
+    }
+
+    const readOptional = async (path: string): Promise<string | undefined> => {
+      try {
+        const { absolutePath } = resolveVaultFile(runtimeState.config!, path);
+        if (!existsSync(absolutePath)) return undefined;
+        return await readFile(absolutePath, "utf8");
+      } catch {
+        return undefined;
+      }
+    };
+
+    const plan = planDreamPass({
+      project,
+      sessionNotes,
+      existingActiveContext: await readOptional(`memory/projects/${project}/active-context.md`),
+      existingMemoryIndex: await readOptional(`memory/projects/${project}/MEMORY.md`),
+      config: { ...dreamConfig, lookbackDays },
+    });
+
+    // Tag automatic Dream Log lines distinctly while reusing the same planner.
+    if (options.mode === "idle") {
+      for (const write of plan.directWrites) {
+        if (write.path === "memory/log.md") {
+          write.content = write.content.replace("dream | manual", "dream | idle");
+        }
+      }
+      plan.summary = plan.summary.replace("Dream (manual)", "Dream (idle)");
+    }
+
+    let wikiMutated = false;
+    for (const write of plan.directWrites) {
+      await writeVaultFile(runtimeState.config, write.path, write.content, write.mode === "append_file");
+      wikiMutated = true;
+    }
+
+    const proposalIds: string[] = [];
+    for (const draft of plan.proposals) {
+      const proposal: ReviewProposal = {
+        id: randomUUID().slice(0, 8),
+        createdAt: new Date().toISOString(),
+        project,
+        source: "auto",
+        rationale: draft.rationale,
+        action: draft.action,
+        path: draft.targetPath,
+        title: draft.title,
+        content: draft.content,
+        status: "pending",
+      };
+      await queueProposal(proposal, options.ctx, { sourceOverride: "dream" });
+      proposalIds.push(proposal.id);
+    }
+
+    if (wikiMutated) {
+      markQmdDirty(options.ctx);
+    } else if (options.ctx) {
+      updateUi(options.ctx);
+    }
+
+    return { summary: plan.summary, proposalIds, wikiMutated };
+  };
+
+  const maybeRunIdleDream = async () => {
+    if (dreamIdleRunning) return;
+    const idleConfig = withDreamIdleDefaults(runtimeState.config?.dreamIdle);
+    // Apply re-arm side effects so consumed flag clears after enough new turns.
+    dreamIdleState = maybeRearmAutoDream(dreamIdleState, idleConfig.minSessionTurns);
+    const decision = evaluateDreamIdleTrigger(idleConfig, dreamIdleState);
+    if (!decision.shouldRun) return;
+    if (!runtimeState.ready || !runtimeState.config) return;
+
+    dreamIdleRunning = true;
+    try {
+      // Re-check mid-turn after awaiting readiness — never run during an agent turn.
+      if (dreamIdleState.agentTurnActive) return;
+      const result = await runDreamPassNow({ mode: "idle", ctx: qmdUiContext });
+      dreamIdleState = markAutoDreamRan(dreamIdleState);
+      if (qmdUiContext?.hasUI) {
+        qmdUiContext.ui.notify(
+          `${result.summary}\nIdle Dream complete. Proposals: ${result.proposalIds.join(", ") || "(none)"}`,
+          "info",
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (qmdUiContext?.hasUI) {
+        qmdUiContext.ui.notify(`Idle Dream failed: ${message}`, "warning");
+      }
+    } finally {
+      dreamIdleRunning = false;
+    }
+  };
+
+  const scheduleDreamIdleTimer = () => {
+    clearDreamIdleTimer();
+    const idleConfig = withDreamIdleDefaults(runtimeState.config?.dreamIdle);
+    if (!idleConfig.enabled) return;
+    dreamIdleTimer = setInterval(() => {
+      void maybeRunIdleDream();
+    }, idleConfig.checkIntervalMs);
+  };
+
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension") return { action: "continue" } as const;
 
+    dreamIdleState = noteDreamIdleActivity(dreamIdleState);
     pendingMemoryIntent = undefined;
     const enabled = runtimeState.config?.autoPropose.enabled ?? true;
     if (enabled) {
@@ -2680,6 +2835,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     clearScheduledMemoryActivity();
     memoryActivity = undefined;
     clearQmdDebounceTimer();
+    clearDreamIdleTimer();
 
     if (runtimeState.ready && runtimeState.config?.qmdSync.enabled && qmdDirtyAt) {
       await runQmdSyncNow({
@@ -2697,6 +2853,8 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     pendingMemoryIntent = undefined;
     clearScheduledMemoryActivity();
     memoryActivity = undefined;
+    dreamIdleState = createDreamIdleState();
+    scheduleDreamIdleTimer();
 
     // Fresh sessions rebuild and may inject the core pack.
     // Reloads keep injection state. Resumes rebuild for widget/status but do not re-inject.
@@ -2799,6 +2957,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
 
   pi.on("agent_end", async (event, ctx) => {
     const messages = Array.isArray(event.messages) ? (event.messages as Array<any>) : [];
+    dreamIdleState = markDreamIdleAgentEnd(dreamIdleState);
 
     if (runtimeState.ready && runtimeState.config?.autoSessionNotes.enabled) {
       const lastUser = [...messages].reverse().find((message) => message.role === "user");
@@ -2912,6 +3071,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    dreamIdleState = markDreamIdleAgentStart(dreamIdleState);
     let systemPrompt = event.systemPrompt;
     let message:
       | {
@@ -3956,84 +4116,22 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         return;
       }
 
-      const project = runtimeState.project || "unknown";
-      const dreamConfig = withDreamDefaults(runtimeState.config.dream);
-      const lookbackArg = args.trim().split(/\s+/).filter(Boolean)[0];
-      const lookbackDays = lookbackArg && Number(lookbackArg) > 0 ? Number(lookbackArg) : dreamConfig.lookbackDays;
-      const dates = dreamLookbackDates(lookbackDays);
-
-      const sessionNotes: Array<{ path: string; content: string }> = [];
-      for (const date of dates) {
-        const path = sessionNotePath(project, date);
-        try {
-          const { absolutePath } = resolveVaultFile(runtimeState.config, path);
-          if (!existsSync(absolutePath)) continue;
-          const content = await readFile(absolutePath, "utf8");
-          sessionNotes.push({ path, content });
-        } catch {
-          // skip unreadable session notes
-        }
+      try {
+        const lookbackArg = args.trim().split(/\s+/).filter(Boolean)[0];
+        const lookbackDays = lookbackArg && Number(lookbackArg) > 0 ? Number(lookbackArg) : undefined;
+        const result = await runDreamPassNow({ lookbackDays, mode: "manual", ctx });
+        const notify = [
+          result.summary,
+          result.proposalIds.length > 0
+            ? `Queued Proposals: ${result.proposalIds.join(", ")}`
+            : "Queued Proposals: (none)",
+          "Dream never hard-deletes Wiki Notes; review Proposals before Apply.",
+        ].join("\n");
+        ctx.ui.notify(notify, "info");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Dream failed: ${message}`, "warning");
       }
-
-      const readOptional = async (path: string): Promise<string | undefined> => {
-        try {
-          const { absolutePath } = resolveVaultFile(runtimeState.config!, path);
-          if (!existsSync(absolutePath)) return undefined;
-          return await readFile(absolutePath, "utf8");
-        } catch {
-          return undefined;
-        }
-      };
-
-      const activePath = `memory/projects/${project}/active-context.md`;
-      const memoryPath = `memory/projects/${project}/MEMORY.md`;
-      const existingActiveContext = await readOptional(activePath);
-      const existingMemoryIndex = await readOptional(memoryPath);
-
-      const plan = planDreamPass({
-        project,
-        sessionNotes,
-        existingActiveContext,
-        existingMemoryIndex,
-        config: { ...dreamConfig, lookbackDays },
-      });
-
-      let wikiMutated = false;
-      for (const write of plan.directWrites) {
-        await writeVaultFile(runtimeState.config, write.path, write.content, write.mode === "append_file");
-        wikiMutated = true;
-      }
-
-      const proposalIds: string[] = [];
-      for (const draft of plan.proposals) {
-        const proposal: ReviewProposal = {
-          id: randomUUID().slice(0, 8),
-          createdAt: new Date().toISOString(),
-          project,
-          source: "auto",
-          rationale: draft.rationale,
-          action: draft.action,
-          path: draft.targetPath,
-          title: draft.title,
-          content: draft.content,
-          status: "pending",
-        };
-        await queueProposal(proposal, ctx, { sourceOverride: "dream" });
-        proposalIds.push(proposal.id);
-      }
-
-      if (wikiMutated) {
-        markQmdDirty(ctx);
-      } else {
-        updateUi(ctx);
-      }
-
-      const notify = [
-        plan.summary,
-        proposalIds.length > 0 ? `Queued Proposals: ${proposalIds.join(", ")}` : "Queued Proposals: (none)",
-        "Dream never hard-deletes Wiki Notes; review Proposals before Apply.",
-      ].join("\n");
-      ctx.ui.notify(notify, "info");
     },
   });
 
