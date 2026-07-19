@@ -33,7 +33,7 @@ last_reviewed: 2026-04-15
 - `projects/<project>/progress.md` — what shipped recently
 - `projects/<project>/overview.md` — goal and constraints
 - `projects/<project>/MEMORY.md` — short budgeted project index for the session core pack
-- `projects/<project>/decisions/` — Decision notes + index
+- `projects/<project>/decisions/` — Decision notes + index (Active vs Superseded; optional `supersedes` / `superseded_by` links)
 - `projects/<project>/system-patterns.md` — durable patterns (usually Proposal-first)
 
 ### Project MEMORY index Note

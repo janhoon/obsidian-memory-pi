@@ -54,6 +54,15 @@ import {
   type MetricEvent,
   type ProposalSourceTag,
 } from "./metrics.js";
+import {
+  buildDecisionIndexHeader,
+  buildDecisionNote,
+  markDecisionSuperseded,
+  nextDecisionIdFromNames,
+  resolveSupersedesRef,
+  sanitizeDecisionTitle,
+  upsertDecisionIndexEntry,
+} from "./decisions.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -314,6 +323,12 @@ const MEMORY_RECORD_DECISION_SCHEMA = Type.Object({
   status: Type.Optional(StringEnum(["proposed", "adopted", "superseded", "rejected"] as const)),
   project: Type.Optional(Type.String({ description: "Project slug override" })),
   date: Type.Optional(Type.String({ description: "Decision date in YYYY-MM-DD format" })),
+  supersedes: Type.Optional(
+    Type.String({
+      description:
+        "Optional prior Decision to supersede (DEC-NNN id, path, or note title containing DEC-NNN). Links both Notes and marks the prior Decision superseded.",
+    }),
+  ),
 });
 const MEMORY_PROPOSE_WRITE_SCHEMA = Type.Object({
   action: StringEnum(["append_log", "append_file", "write_file"] as const),
@@ -1945,84 +1960,15 @@ async function ingestMemorySource(
   }
 }
 
-function sanitizeDecisionTitle(title: string): string {
-  const cleaned = title.replace(/[\\/:*?"<>|]/g, "").replace(/\s+/g, " ").trim();
-  return cleaned || "Untitled decision";
-}
-
-async function getNextDecisionId(config: MemoryConfig, project: string): Promise<string> {
+async function listDecisionFileNames(config: MemoryConfig, project: string): Promise<string[]> {
   const decisionsDir = resolve(config.vaultPath, `memory/projects/${project}/decisions`);
   await mkdir(decisionsDir, { recursive: true });
   const entries = await readdir(decisionsDir, { withFileTypes: true });
-  let maxId = 0;
-
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const match = entry.name.match(/^DEC-(\d+)/i);
-    if (!match) continue;
-    maxId = Math.max(maxId, Number(match[1]));
-  }
-
-  return `DEC-${String(maxId + 1).padStart(3, "0")}`;
+  return entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
 }
 
-function buildDecisionNote(params: {
-  decisionId: string;
-  project: string;
-  title: string;
-  summary: string;
-  rationale: string;
-  alternatives?: string;
-  consequences?: string;
-  status: string;
-  date: string;
-}): string {
-  const title = sanitizeDecisionTitle(params.title);
-  const sections = [
-    "---",
-    "type: decision",
-    "scope: project",
-    `project: ${params.project}`,
-    `relevance: high`,
-    `status: ${params.status}`,
-    `decision_id: ${params.decisionId}`,
-    `last_reviewed: ${params.date}`,
-    "---",
-    `# ${params.decisionId} - ${title}`,
-    "",
-    "## Summary",
-    "",
-    params.summary.trim(),
-    "",
-    "## Rationale",
-    "",
-    params.rationale.trim(),
-  ];
-
-  if (params.alternatives?.trim()) {
-    sections.push("", "## Alternatives considered", "", params.alternatives.trim());
-  }
-  if (params.consequences?.trim()) {
-    sections.push("", "## Consequences", "", params.consequences.trim());
-  }
-
-  return sections.join("\n") + "\n";
-}
-
-function buildDecisionIndexHeader(project: string): string {
-  return `---\ntype: context\nscope: project\nrelevance: medium\nlast_reviewed: ${new Date().toISOString().slice(0, 10)}\n---\n# Decision index\n\nProject: ${project}\n\n`;
-}
-
-function buildDecisionIndexEntry(params: {
-  decisionId: string;
-  title: string;
-  summary: string;
-  status: string;
-  date: string;
-}): string {
-  const safeTitle = sanitizeDecisionTitle(params.title);
-  const shortSummary = params.summary.replace(/\s+/g, " ").trim();
-  return `- ${params.date} — [[${params.decisionId} - ${safeTitle}|${params.decisionId}]] — ${params.status} — ${shortSummary}\n`;
+async function getNextDecisionId(config: MemoryConfig, project: string): Promise<string> {
+  return nextDecisionIdFromNames(await listDecisionFileNames(config, project));
 }
 
 function isoDateNow(): string {
@@ -3173,6 +3119,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use memory_record_decision when the user wants a decision preserved with rationale, alternatives, and consequences.",
       "Ask for missing rationale first if the decision is under-specified, then call this tool once the decision is clear.",
+      "When replacing a prior Decision, pass supersedes with a DEC-NNN id so both Notes link and the prior status becomes superseded.",
     ],
     parameters: MEMORY_RECORD_DECISION_SCHEMA,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -3189,7 +3136,45 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         const date = params.date?.trim() || new Date().toISOString().slice(0, 10);
         const status = params.status || "adopted";
         const safeTitle = sanitizeDecisionTitle(params.title);
-        const decisionId = await getNextDecisionId(runtimeState.config, project);
+        const decisionFiles = await listDecisionFileNames(runtimeState.config, project);
+        const decisionId = nextDecisionIdFromNames(decisionFiles);
+
+        let supersedesId: string | undefined;
+        let supersedesTitle: string | undefined;
+        let priorRelativePath: string | undefined;
+        let priorUpdatedBody: string | undefined;
+        let priorSummary = "";
+
+        if (params.supersedes?.trim()) {
+          const resolved = resolveSupersedesRef(params.supersedes, decisionFiles);
+          if (!resolved.ok) {
+            throw new Error(resolved.error);
+          }
+          supersedesId = resolved.decisionId;
+          supersedesTitle = resolved.title;
+          priorRelativePath = `memory/projects/${project}/decisions/${resolved.fileName}`;
+          const priorAbsolute = resolveVaultFile(runtimeState.config, priorRelativePath).absolutePath;
+          if (!existsSync(priorAbsolute)) {
+            throw new Error(
+              `Prior Decision Note missing at ${priorRelativePath}. Incomplete supersession ref — not writing either Note.`,
+            );
+          }
+          const priorContent = await readFile(priorAbsolute, "utf8");
+          const summaryMatch = priorContent.match(/## Summary\s*\n+([\s\S]*?)(?=\n## |\n---|$)/i);
+          priorSummary = (summaryMatch?.[1] || "").replace(/\s+/g, " ").trim();
+          const marked = markDecisionSuperseded(priorContent, {
+            newDecisionId: decisionId,
+            newTitle: safeTitle,
+            date,
+          });
+          if (!marked) {
+            throw new Error(
+              `Prior file ${priorRelativePath} is not a recognizable Decision Note. Incomplete supersession ref — not writing either Note.`,
+            );
+          }
+          priorUpdatedBody = marked;
+        }
+
         const notePath = `memory/projects/${project}/decisions/${decisionId} - ${safeTitle}.md`;
         const indexPath = `memory/projects/${project}/decisions/index.md`;
         const noteBody = buildDecisionNote({
@@ -3202,39 +3187,61 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           consequences: params.consequences,
           status,
           date,
+          supersedes: supersedesId,
+          supersedesTitle,
         });
 
+        // Write prior (if any) then new Note so a failure before either mutates nothing partially without links.
+        if (priorRelativePath && priorUpdatedBody) {
+          await writeVaultFile(runtimeState.config, priorRelativePath, priorUpdatedBody, false);
+        }
         await writeVaultFile(runtimeState.config, notePath, noteBody, false);
 
         const { absolutePath: indexAbsolutePath } = resolveVaultFile(runtimeState.config, indexPath);
-        if (!existsSync(indexAbsolutePath)) {
-          await writeVaultFile(runtimeState.config, indexPath, buildDecisionIndexHeader(project), false);
-        }
-        await writeVaultFile(
-          runtimeState.config,
-          indexPath,
-          buildDecisionIndexEntry({
-            decisionId,
-            title: safeTitle,
-            summary: params.summary,
-            status,
-            date,
-          }),
-          true,
-        );
+        let indexContent = existsSync(indexAbsolutePath)
+          ? await readFile(indexAbsolutePath, "utf8")
+          : buildDecisionIndexHeader(project, date);
 
-        const logEntry = `\n## [${date}] decision | ${decisionId}\n\nRecorded ${decisionId} for project \`${project}\`: ${safeTitle}\n`;
+        if (supersedesId) {
+          indexContent = upsertDecisionIndexEntry(indexContent, {
+            decisionId: supersedesId,
+            title: supersedesTitle || supersedesId,
+            summary: priorSummary || "(prior Decision)",
+            status: "superseded",
+            date,
+            supersededBy: decisionId,
+          });
+        }
+        indexContent = upsertDecisionIndexEntry(indexContent, {
+          decisionId,
+          title: safeTitle,
+          summary: params.summary,
+          status,
+          date,
+          supersedes: supersedesId,
+        });
+        await writeVaultFile(runtimeState.config, indexPath, indexContent, false);
+
+        const supersedeNote = supersedesId ? ` (supersedes ${supersedesId})` : "";
+        const logEntry = `\n## [${date}] decision | ${decisionId}\n\nRecorded ${decisionId} for project \`${project}\`: ${safeTitle}${supersedeNote}\n`;
         await writeVaultFile(runtimeState.config, "memory/log.md", logEntry, true);
         markQmdDirty(ctx);
 
         return {
-          content: [{ type: "text", text: `Recorded ${decisionId} at ${notePath}` }],
+          content: [
+            {
+              type: "text",
+              text: `Recorded ${decisionId} at ${notePath}${supersedesId ? `; superseded ${supersedesId}` : ""}`,
+            },
+          ],
           details: {
             decisionId,
             project,
             status,
             path: notePath,
             indexPath,
+            supersedes: supersedesId,
+            priorPath: priorRelativePath,
           },
         };
       });
