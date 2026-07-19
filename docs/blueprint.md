@@ -211,11 +211,13 @@ Inputs:
 - optional `status`
 - optional `project`
 - optional `date`
+- optional `supersedes` — prior Decision id (`DEC-NNN`) to mark superseded with bidirectional links
 
 Behavior:
 
 - creates `DEC-XXX - Title.md` under `memory/projects/<project>/decisions/`
-- appends an entry to `memory/projects/<project>/decisions/index.md`
+- updates `memory/projects/<project>/decisions/index.md` with Active vs Superseded sections
+- when `supersedes` is set: marks the prior Decision `status: superseded`, links forward to the new Decision, and links the new Decision back; incomplete refs fail without writing either Note
 - appends a log entry to `memory/log.md`
 
 ### `memory_ingest_source`
