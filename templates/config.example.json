@@ -78,6 +78,11 @@
     "maxProposalsPerTurn": 2,
     "disabledByDiscardRate": false
   },
+  "dream": {
+    "lookbackDays": 3,
+    "maxContextChars": 4000,
+    "maxProposals": 5
+  },
   "preCompactionFlush": {
     "enabled": true,
     "maxTurns": 8,

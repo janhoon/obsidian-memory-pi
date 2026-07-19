@@ -82,6 +82,13 @@ import {
   latestMetricTimestamps,
   planAuditProposals,
 } from "./audit-proposals.js";
+import {
+  dreamLookbackDates,
+  planDreamPass,
+  sessionNotePath,
+  withDreamDefaults,
+  type DreamConfig,
+} from "./dream.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -142,6 +149,8 @@ type MemoryConfig = {
   };
   /** Significance extract capture (review-only Proposals when no memory tool ran). */
   significanceCapture: SignificanceConfig;
+  /** Manual Dream consolidation (Session notes → Wiki + Proposals). */
+  dream: DreamConfig;
   preCompactionFlush: {
     enabled: boolean;
     maxTurns: number;
@@ -474,6 +483,7 @@ function buildDefaultConfigExample(): string {
       triggerPatterns: [...DEFAULT_AUTO_PROPOSE_PATTERNS],
     },
     significanceCapture: withSignificanceDefaults(),
+    dream: withDreamDefaults(),
     preCompactionFlush: {
       enabled: DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
@@ -539,6 +549,7 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
       triggerPatterns: config.autoPropose?.triggerPatterns || [...DEFAULT_AUTO_PROPOSE_PATTERNS],
     },
     significanceCapture: withSignificanceDefaults(config.significanceCapture),
+    dream: withDreamDefaults(config.dream),
     preCompactionFlush: {
       enabled: config.preCompactionFlush?.enabled ?? DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: config.preCompactionFlush?.maxTurns || DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
@@ -1074,6 +1085,7 @@ function renderStatus(
     `Auto session notes: ${state.config?.autoSessionNotes.enabled ? "on" : "off"}`,
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
     `Significance extract: ${state.config?.significanceCapture.enabled ? `on (max ${state.config.significanceCapture.maxProposalsPerTurn}/turn)` : "off"}${state.config?.significanceCapture.disabledByDiscardRate ? " · kill-switch" : ""}`,
+    `Dream lookback: ${state.config?.dream.lookbackDays ?? 3}d · max proposals ${state.config?.dream.maxProposals ?? 5}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
     `QMD auto-sync: ${state.config?.qmdSync.enabled ? "on" : "off"}`,
     `QMD sync mode: ${state.config?.qmdSync.mode || DEFAULT_QMD_SYNC_CONFIG.mode}`,
@@ -3929,6 +3941,99 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       });
 
       ctx.ui.notify(text, runtimeState.ready ? "info" : "warning");
+    },
+  });
+
+  pi.registerCommand("memory-dream", {
+    description:
+      "Manual Dream pass: promote recent Session notes into Wiki Notes + review Proposals. /memory-dream [lookbackDays]",
+    handler: async (args, ctx) => {
+      runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
+      reviewQueue = await loadReviewQueue();
+      updateUi(ctx);
+      if (!runtimeState.ready || !runtimeState.config) {
+        ctx.ui.notify("Memory system is not configured.", "error");
+        return;
+      }
+
+      const project = runtimeState.project || "unknown";
+      const dreamConfig = withDreamDefaults(runtimeState.config.dream);
+      const lookbackArg = args.trim().split(/\s+/).filter(Boolean)[0];
+      const lookbackDays = lookbackArg && Number(lookbackArg) > 0 ? Number(lookbackArg) : dreamConfig.lookbackDays;
+      const dates = dreamLookbackDates(lookbackDays);
+
+      const sessionNotes: Array<{ path: string; content: string }> = [];
+      for (const date of dates) {
+        const path = sessionNotePath(project, date);
+        try {
+          const { absolutePath } = resolveVaultFile(runtimeState.config, path);
+          if (!existsSync(absolutePath)) continue;
+          const content = await readFile(absolutePath, "utf8");
+          sessionNotes.push({ path, content });
+        } catch {
+          // skip unreadable session notes
+        }
+      }
+
+      const readOptional = async (path: string): Promise<string | undefined> => {
+        try {
+          const { absolutePath } = resolveVaultFile(runtimeState.config!, path);
+          if (!existsSync(absolutePath)) return undefined;
+          return await readFile(absolutePath, "utf8");
+        } catch {
+          return undefined;
+        }
+      };
+
+      const activePath = `memory/projects/${project}/active-context.md`;
+      const memoryPath = `memory/projects/${project}/MEMORY.md`;
+      const existingActiveContext = await readOptional(activePath);
+      const existingMemoryIndex = await readOptional(memoryPath);
+
+      const plan = planDreamPass({
+        project,
+        sessionNotes,
+        existingActiveContext,
+        existingMemoryIndex,
+        config: { ...dreamConfig, lookbackDays },
+      });
+
+      let wikiMutated = false;
+      for (const write of plan.directWrites) {
+        await writeVaultFile(runtimeState.config, write.path, write.content, write.mode === "append_file");
+        wikiMutated = true;
+      }
+
+      const proposalIds: string[] = [];
+      for (const draft of plan.proposals) {
+        const proposal: ReviewProposal = {
+          id: randomUUID().slice(0, 8),
+          createdAt: new Date().toISOString(),
+          project,
+          source: "auto",
+          rationale: draft.rationale,
+          action: draft.action,
+          path: draft.targetPath,
+          title: draft.title,
+          content: draft.content,
+          status: "pending",
+        };
+        await queueProposal(proposal, ctx, { sourceOverride: "dream" });
+        proposalIds.push(proposal.id);
+      }
+
+      if (wikiMutated) {
+        markQmdDirty(ctx);
+      } else {
+        updateUi(ctx);
+      }
+
+      const notify = [
+        plan.summary,
+        proposalIds.length > 0 ? `Queued Proposals: ${proposalIds.join(", ")}` : "Queued Proposals: (none)",
+        "Dream never hard-deletes Wiki Notes; review Proposals before Apply.",
+      ].join("\n");
+      ctx.ui.notify(notify, "info");
     },
   });
 
