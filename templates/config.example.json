@@ -1,0 +1,91 @@
+{
+  "vaultPath": "/absolute/path/to/obsidian-vault",
+  "qmdCommand": "qmd",
+  "qmdCollection": "obsidian-memory",
+  "defaultSearchMode": "hybrid",
+  "defaultLimit": 5,
+  "routerFiles": [
+    "memory/schema.md",
+    "memory/index.md",
+    "memory/working-context.md",
+    "memory/triggers.md",
+    "memory/glossary.md"
+  ],
+  "scopePrefixes": {
+    "global": [
+      "memory/schema.md",
+      "memory/index.md",
+      "memory/triggers.md",
+      "memory/glossary.md",
+      "memory/working-context.md",
+      "memory/global/"
+    ],
+    "projectTemplate": "memory/projects/{project}/",
+    "sessionTemplate": "memory/sessions/{project}/"
+  },
+  "autoRecall": {
+    "enabled": true,
+    "maxResults": 4,
+    "timeoutMs": 60000,
+    "clearDelayMs": 5000,
+    "triggerPatterns": [
+      "continue",
+      "last session",
+      "what did we decide",
+      "why did we",
+      "remember",
+      "context",
+      "catch up",
+      "project status"
+    ]
+  },
+  "autoSessionNotes": {
+    "enabled": true,
+    "maxAssistantChars": 280,
+    "includeTools": true
+  },
+  "autoPropose": {
+    "enabled": true,
+    "triggerPatterns": [
+      "remember this",
+      "save this",
+      "make a note",
+      "note this",
+      "capture this",
+      "file this",
+      "don't forget",
+      "store this",
+      "put this in memory",
+      "add this to memory",
+      "write this down"
+    ]
+  },
+  "preCompactionFlush": {
+    "enabled": true,
+    "maxTurns": 8,
+    "includeFiles": true
+  },
+  "qmdSync": {
+    "enabled": true,
+    "mode": "update",
+    "debounceMs": 30000,
+    "embed": "end_of_session",
+    "markSessionNotesDirty": false,
+    "showStaleInWidget": true
+  },
+  "ingest": {
+    "doclingCommand": "docling",
+    "ffmpegCommand": "ffmpeg",
+    "doclingTimeoutMs": 120000,
+    "ffmpegTimeoutMs": 120000,
+    "qmdSyncAfterIngest": true,
+    "qmdUpdateTimeoutMs": 60000,
+    "qmdEmbedTimeoutMs": 180000,
+    "maxSourceCopyBytes": 26214400,
+    "maxExtractedCharsInMemory": 50000,
+    "videoFrameIntervalSec": 30,
+    "maxVideoFrames": 12,
+    "doclingImageExportMode": "placeholder"
+  },
+  "projectMappings": []
+}

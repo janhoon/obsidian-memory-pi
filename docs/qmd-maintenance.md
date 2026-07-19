@@ -108,22 +108,53 @@ When QMD changes version or behavior, do a compatibility pass:
    scripts/qmd-memory-sync.sh --force-embed
    ```
 
-## Future automation inside the Pi extension
+## Extension automation (debounced dirty sync)
 
-The next extension-level improvement should be a debounced background sync:
+The Pi extension keeps a dirty flag after durable wiki writes and refreshes QMD on a debounce so Auto-recall / Search can see new Notes without a stampede of child processes.
 
-- Add config such as:
-  ```json
-  "qmdSync": {
-    "enabled": true,
-    "mode": "update",
-    "debounceMs": 30000,
-    "embed": "manual"
-  }
-  ```
-- After `memory_write`, `memory_record_decision`, applied review proposals, session note writes, and pre-compaction flushes, mark QMD dirty.
-- Debounce `qmd update` so multiple writes in one turn cause one refresh.
-- Keep `qmd embed` manual or end-of-session by default because embeddings can be slow on CPU.
-- Add a `/memory-qmd-sync` command for explicit foreground refresh and a widget warning when QMD is stale.
+Config (`~/.pi/agent/memory/config.json`):
 
-Until that lands, use `scripts/qmd-memory-sync.sh` as the canonical manual/cron/systemd entrypoint.
+```json
+"qmdSync": {
+  "enabled": true,
+  "mode": "update",
+  "debounceMs": 30000,
+  "embed": "end_of_session",
+  "markSessionNotesDirty": false,
+  "showStaleInWidget": true
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `enabled` | Master switch for auto dirty + debounced refresh |
+| `mode` | Default operator/debounced path: `update` (lexical only) or `full` (update + embed) |
+| `debounceMs` | Coalesce window after a dirty mark (default 30s ≈ “within about a minute”) |
+| `embed` | `manual` (never auto-embed), `end_of_session` (embed on session_shutdown when needed), `after_update` (embed after every debounced update) |
+| `markSessionNotesDirty` | When false (default), session-note appends do not dirty the index |
+| `showStaleInWidget` | Show `QMD stale` / `QMD syncing…` in the below-editor widget |
+
+### What marks dirty
+
+- `memory_write`
+- `memory_record_decision`
+- Review proposal **Apply** (`/memory-review apply` / pick)
+- `memory_ingest_source` when it did **not** already refresh QMD (successful ingest refresh **clears** dirty)
+- Session-note / pre-compaction appends only when `markSessionNotesDirty` is true
+
+### Operator command
+
+```text
+/memory-qmd-sync            # uses config.qmdSync.mode
+/memory-qmd-sync update     # foreground qmd update only
+/memory-qmd-sync full       # update + embed
+/memory-qmd-sync full --force-embed
+```
+
+Concurrent writes and concurrent sync requests share one in-flight QMD process; a write that lands mid-sync keeps the index dirty and schedules another debounced pass.
+
+The shell script remains the canonical cron/systemd entrypoint outside Pi:
+
+```bash
+scripts/qmd-memory-sync.sh
+```

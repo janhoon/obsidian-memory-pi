@@ -25,11 +25,13 @@ This package is the first implementation pass. It currently provides:
   - `/memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]`
   - `/memory-review [list|show|pick|apply|discard] [id|next|all]`
   - `/memory-audit-now [scope] [project] [staleDays]`
+  - `/memory-qmd-sync [update|full] [--force-embed]`
   - `/memory-init-config`
   - `/memory-reload`
   - automatic pre-answer memory recall heuristics via `before_agent_start`
   - below-editor memory activity indicators for recall, reads, searches, writes, review, and audit operations
   - configurable auto-recall timeout / activity-clear delay under `autoRecall.timeoutMs` and `autoRecall.clearDelayMs`
+  - debounced QMD dirty sync after durable wiki writes (`qmdSync` config) with widget stale/syncing states
   - automatic proposal queuing for explicit `remember this` / `save this` style requests
   - automatic session-note writing on session start and agent completion
   - pre-compaction session flushing before Pi compresses context
@@ -49,7 +51,7 @@ This package is the first implementation pass. It currently provides:
 This is still an early system, not the finished product. The following are still roadmap items:
 
 - stronger memory write schemas for facts / insights / preferences
-- background QMD syncing and richer health widgets
+- richer memory health widgets beyond QMD stale/syncing
 - smarter contradiction detection beyond heuristic candidates
 - richer source-ingest automation beyond the initial Docling local-path/URL flow
 - richer policy for where auto-captured facts should land beyond active-context / working-context
@@ -96,11 +98,13 @@ The extension reads configuration from:
 ~/.pi/agent/memory/config.json
 ```
 
-A starter file is available at:
+A starter file ships with the package at:
 
 ```text
-~/.pi/agent/memory/config.example.json
+templates/config.example.json
 ```
+
+`/memory-init-config` copies that template to `~/.pi/agent/memory/config.json` (or writes built-in defaults if the package template is unavailable).
 
 Automatic recall uses `autoRecall.timeoutMs` (default `60000`) and `autoRecall.clearDelayMs` (default `5000`) when those fields are omitted from config.
 

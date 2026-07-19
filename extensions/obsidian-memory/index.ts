@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@mariozechner/pi-ai";
 import {
   getAgentDir,
@@ -11,6 +12,15 @@ import {
   withFileMutationQueue,
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import {
+  formatQmdIndexWidgetLabel,
+  shouldClearDirtyAfterSync,
+  shouldIncludeEmbedForDebouncedSync,
+  shouldIncludeEmbedForSessionEnd,
+  type QmdEmbedMode,
+  type QmdIndexUiState,
+  type QmdSyncMode,
+} from "./qmd-sync-policy.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -21,10 +31,21 @@ type IngestKindInput = (typeof INGEST_KINDS)[number];
 type IngestKind = Exclude<IngestKindInput, "auto">;
 const DOCLING_IMAGE_EXPORT_MODES = ["placeholder", "embedded", "referenced"] as const;
 type DoclingImageExportMode = (typeof DOCLING_IMAGE_EXPORT_MODES)[number];
+const QMD_SYNC_MODES = ["update", "full"] as const;
+const QMD_EMBED_MODES = ["manual", "end_of_session", "after_update"] as const;
 
 type ProjectMapping = {
   cwdPattern: string;
   project: string;
+};
+
+type QmdSyncConfig = {
+  enabled: boolean;
+  mode: QmdSyncMode;
+  debounceMs: number;
+  embed: QmdEmbedMode;
+  markSessionNotesDirty: boolean;
+  showStaleInWidget: boolean;
 };
 
 type MemoryConfig = {
@@ -60,6 +81,7 @@ type MemoryConfig = {
     maxTurns: number;
     includeFiles: boolean;
   };
+  qmdSync: QmdSyncConfig;
   ingest: {
     doclingCommand: string;
     ffmpegCommand: string;
@@ -200,6 +222,15 @@ const DEFAULT_PRE_COMPACTION_FLUSH = {
   includeFiles: true,
 } as const;
 
+const DEFAULT_QMD_SYNC_CONFIG: QmdSyncConfig = {
+  enabled: true,
+  mode: "update",
+  debounceMs: 30_000,
+  embed: "end_of_session",
+  markSessionNotesDirty: false,
+  showStaleInWidget: true,
+};
+
 const DEFAULT_INGEST_CONFIG = {
   doclingCommand: "docling",
   ffmpegCommand: "ffmpeg",
@@ -305,6 +336,74 @@ function resolveConfigPath(): string {
   return join(getAgentDir(), "memory", "config.json");
 }
 
+function resolvePackageRoot(): string {
+  // extensions/obsidian-memory/index.ts -> package root
+  return resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+}
+
+function resolveExampleConfigPath(): string {
+  const packageExample = join(resolvePackageRoot(), "templates", "config.example.json");
+  if (existsSync(packageExample)) return packageExample;
+
+  // Backward-compatible fallback if someone installed the example under the agent dir.
+  return join(getAgentDir(), "memory", "config.example.json");
+}
+
+function buildDefaultConfigExample(): string {
+  const example: Partial<MemoryConfig> = {
+    vaultPath: "/absolute/path/to/obsidian-vault",
+    qmdCommand: "qmd",
+    qmdCollection: "obsidian-memory",
+    defaultSearchMode: "hybrid",
+    defaultLimit: 5,
+    routerFiles: [
+      "memory/schema.md",
+      "memory/index.md",
+      "memory/working-context.md",
+      "memory/triggers.md",
+      "memory/glossary.md",
+    ],
+    scopePrefixes: {
+      global: [...DEFAULT_GLOBAL_PREFIXES],
+      projectTemplate: "memory/projects/{project}/",
+      sessionTemplate: "memory/sessions/{project}/",
+    },
+    autoRecall: {
+      enabled: true,
+      maxResults: 4,
+      timeoutMs: DEFAULT_AUTO_RECALL_TIMEOUT_MS,
+      clearDelayMs: DEFAULT_AUTO_RECALL_CLEAR_DELAY_MS,
+      triggerPatterns: [...DEFAULT_AUTO_RECALL_PATTERNS],
+    },
+    autoSessionNotes: {
+      enabled: DEFAULT_AUTO_SESSION_NOTES.enabled,
+      maxAssistantChars: DEFAULT_AUTO_SESSION_NOTES.maxAssistantChars,
+      includeTools: DEFAULT_AUTO_SESSION_NOTES.includeTools,
+    },
+    autoPropose: {
+      enabled: true,
+      triggerPatterns: [...DEFAULT_AUTO_PROPOSE_PATTERNS],
+    },
+    preCompactionFlush: {
+      enabled: DEFAULT_PRE_COMPACTION_FLUSH.enabled,
+      maxTurns: DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
+      includeFiles: DEFAULT_PRE_COMPACTION_FLUSH.includeFiles,
+    },
+    qmdSync: { ...DEFAULT_QMD_SYNC_CONFIG },
+    ingest: { ...DEFAULT_INGEST_CONFIG },
+    projectMappings: [],
+  };
+  return `${JSON.stringify(example, null, 2)}\n`;
+}
+
+async function readExampleConfigSource(): Promise<{ content: string; source: string }> {
+  const examplePath = resolveExampleConfigPath();
+  if (existsSync(examplePath)) {
+    return { content: await readFile(examplePath, "utf8"), source: examplePath };
+  }
+  return { content: buildDefaultConfigExample(), source: "built-in defaults" };
+}
+
 function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
   const configuredVaultPath = config.vaultPath ? resolve(expandHome(config.vaultPath)) : "";
   return {
@@ -351,6 +450,21 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
       enabled: config.preCompactionFlush?.enabled ?? DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: config.preCompactionFlush?.maxTurns || DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
       includeFiles: config.preCompactionFlush?.includeFiles ?? DEFAULT_PRE_COMPACTION_FLUSH.includeFiles,
+    },
+    qmdSync: {
+      enabled: config.qmdSync?.enabled ?? DEFAULT_QMD_SYNC_CONFIG.enabled,
+      mode: QMD_SYNC_MODES.includes(config.qmdSync?.mode as QmdSyncMode)
+        ? (config.qmdSync?.mode as QmdSyncMode)
+        : DEFAULT_QMD_SYNC_CONFIG.mode,
+      debounceMs:
+        Number.isFinite(config.qmdSync?.debounceMs) && (config.qmdSync?.debounceMs ?? 0) >= 0
+          ? config.qmdSync?.debounceMs ?? DEFAULT_QMD_SYNC_CONFIG.debounceMs
+          : DEFAULT_QMD_SYNC_CONFIG.debounceMs,
+      embed: QMD_EMBED_MODES.includes(config.qmdSync?.embed as QmdEmbedMode)
+        ? (config.qmdSync?.embed as QmdEmbedMode)
+        : DEFAULT_QMD_SYNC_CONFIG.embed,
+      markSessionNotesDirty: config.qmdSync?.markSessionNotesDirty ?? DEFAULT_QMD_SYNC_CONFIG.markSessionNotesDirty,
+      showStaleInWidget: config.qmdSync?.showStaleInWidget ?? DEFAULT_QMD_SYNC_CONFIG.showStaleInWidget,
     },
     ingest: {
       doclingCommand: config.ingest?.doclingCommand || DEFAULT_INGEST_CONFIG.doclingCommand,
@@ -659,6 +773,7 @@ function buildWidgetLines(
   sessionNotesEnabled: boolean,
   pendingIntent?: PendingMemoryIntent,
   activity?: MemoryActivity,
+  qmdIndex?: QmdIndexUiState,
 ): string[] {
   const pending = getPendingReviewProposals(pendingQueue);
   const review = ctx.ui.theme.fg(pending.length > 0 ? "warning" : "dim", `review ${pending.length} pending`);
@@ -670,6 +785,12 @@ function buildWidgetLines(
     const color = activity.state === "complete" ? "success" : activity.state === "running" ? "accent" : "warning";
     lines.push(ctx.ui.theme.fg(color, activity.text));
     return lines;
+  }
+
+  const qmdLabel = formatQmdIndexWidgetLabel(qmdIndex);
+  if (qmdLabel) {
+    const color = qmdIndex?.syncing ? "accent" : "warning";
+    lines.push(ctx.ui.theme.fg(color, qmdLabel));
   }
 
   if (pending.length > 0) {
@@ -696,14 +817,16 @@ function setStatus(
   sessionNotesEnabled: boolean = false,
   pendingIntent?: PendingMemoryIntent,
   activity?: MemoryActivity,
+  qmdIndex?: QmdIndexUiState,
 ) {
   if (!ctx.hasUI) return;
 
   if (state.ready) {
     const pendingReviewCount = getPendingReviewProposals(pendingQueue).length;
     const suffix = pendingReviewCount > 0 ? ` +${pendingReviewCount} review` : "";
-    ctx.ui.setStatus("obsidian-memory", `memory:${state.project || "unknown"}${suffix}`);
-    ctx.ui.setWidget("obsidian-memory", buildWidgetLines(ctx, state, pendingQueue, sessionNotesEnabled, pendingIntent, activity), {
+    const qmdSuffix = qmdIndex?.syncing ? " · qmd syncing" : qmdIndex?.dirty ? " · qmd stale" : "";
+    ctx.ui.setStatus("obsidian-memory", `memory:${state.project || "unknown"}${suffix}${qmdSuffix}`);
+    ctx.ui.setWidget("obsidian-memory", buildWidgetLines(ctx, state, pendingQueue, sessionNotesEnabled, pendingIntent, activity, qmdIndex), {
       placement: "belowEditor",
     });
   } else {
@@ -733,6 +856,11 @@ function renderStatus(state: RuntimeState, qmdStatus?: string, pendingReviewCoun
     `Auto session notes: ${state.config?.autoSessionNotes.enabled ? "on" : "off"}`,
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
+    `QMD auto-sync: ${state.config?.qmdSync.enabled ? "on" : "off"}`,
+    `QMD sync mode: ${state.config?.qmdSync.mode || DEFAULT_QMD_SYNC_CONFIG.mode}`,
+    `QMD sync debounce: ${state.config?.qmdSync.debounceMs ?? DEFAULT_QMD_SYNC_CONFIG.debounceMs}ms`,
+    `QMD embed policy: ${state.config?.qmdSync.embed || DEFAULT_QMD_SYNC_CONFIG.embed}`,
+    `QMD mark session notes dirty: ${state.config?.qmdSync.markSessionNotesDirty ? "on" : "off"}`,
     `Docling command: ${state.config?.ingest.doclingCommand || DEFAULT_INGEST_CONFIG.doclingCommand}`,
     `FFmpeg command: ${state.config?.ingest.ffmpegCommand || DEFAULT_INGEST_CONFIG.ffmpegCommand}`,
     `Media ingest QMD sync: ${state.config?.ingest.qmdSyncAfterIngest ? "on" : "off"}`,
@@ -1393,24 +1521,50 @@ function buildIngestMemoryNote(params: {
   return lines.join("\n");
 }
 
-async function refreshQmdAfterIngest(pi: ExtensionAPI, config: MemoryConfig, signal?: AbortSignal): Promise<string[]> {
+type QmdRefreshOptions = {
+  includeEmbed?: boolean;
+  forceEmbed?: boolean;
+  signal?: AbortSignal;
+};
+
+type QmdRefreshResult = {
+  warnings: string[];
+  updated: boolean;
+  embedded: boolean;
+};
+
+async function runQmdRefresh(pi: ExtensionAPI, config: MemoryConfig, options: QmdRefreshOptions = {}): Promise<QmdRefreshResult> {
   const warnings: string[] = [];
-  const update = await runConfiguredCommand(pi, config.qmdCommand, ["update"], { timeout: config.ingest.qmdUpdateTimeoutMs, signal });
+  const update = await runConfiguredCommand(pi, config.qmdCommand, ["update"], {
+    timeout: config.ingest.qmdUpdateTimeoutMs,
+    signal: options.signal,
+  });
   if (update.code !== 0) {
     warnings.push(`qmd update failed: ${(update.stderr || update.stdout || `exit ${update.code}`).trim()}`);
-    return warnings;
+    return { warnings, updated: false, embedded: false };
   }
 
-  const embed = await runConfiguredCommand(
-    pi,
-    config.qmdCommand,
-    ["embed", "--max-docs-per-batch", "32", "--max-batch-mb", "8"],
-    { timeout: config.ingest.qmdEmbedTimeoutMs, signal },
-  );
+  if (!options.includeEmbed) {
+    return { warnings, updated: true, embedded: false };
+  }
+
+  const embedArgs = ["embed", "--max-docs-per-batch", "32", "--max-batch-mb", "8"];
+  if (options.forceEmbed) embedArgs.push("-f");
+  const embed = await runConfiguredCommand(pi, config.qmdCommand, embedArgs, {
+    timeout: config.ingest.qmdEmbedTimeoutMs,
+    signal: options.signal,
+  });
   if (embed.code !== 0) {
     warnings.push(`qmd embed failed: ${(embed.stderr || embed.stdout || `exit ${embed.code}`).trim()}`);
+    return { warnings, updated: true, embedded: false };
   }
-  return warnings;
+
+  return { warnings, updated: true, embedded: true };
+}
+
+async function refreshQmdAfterIngest(pi: ExtensionAPI, config: MemoryConfig, signal?: AbortSignal): Promise<string[]> {
+  const result = await runQmdRefresh(pi, config, { includeEmbed: true, signal });
+  return result.warnings;
 }
 
 function renderIngestResult(result: MemoryIngestResult): string {
@@ -2004,8 +2158,27 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   let memoryActivity: MemoryActivity | undefined;
   let memoryActivitySequence = 0;
   let memoryActivityClearTimer: ReturnType<typeof setTimeout> | undefined;
+  let qmdDirtyAt: number | undefined;
+  let qmdSyncing = false;
+  let qmdLastError: string | undefined;
+  let qmdDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let qmdSyncInFlight: Promise<void> | undefined;
+  let qmdSyncFlightResolve: (() => void) | undefined;
+  let qmdUiContext: ExtensionContext | undefined;
+  let qmdResyncRequested = false;
+
+  const getQmdIndexUiState = (): QmdIndexUiState | undefined => {
+    const showStale = runtimeState.config?.qmdSync.showStaleInWidget ?? DEFAULT_QMD_SYNC_CONFIG.showStaleInWidget;
+    const dirty = Boolean(qmdDirtyAt);
+    // Always surface active sync / last error; stale-only is config-gated.
+    if (qmdSyncing) return { dirty, syncing: true, lastError: qmdLastError };
+    if (qmdLastError) return { dirty, syncing: false, lastError: qmdLastError };
+    if (dirty && showStale) return { dirty: true, syncing: false };
+    return undefined;
+  };
 
   const updateUi = (ctx?: ExtensionContext) => {
+    if (ctx) qmdUiContext = ctx;
     if (!ctx) return;
     setStatus(
       ctx,
@@ -2014,7 +2187,137 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       Boolean(runtimeState.config?.autoSessionNotes.enabled),
       pendingMemoryIntent,
       memoryActivity,
+      getQmdIndexUiState(),
     );
+  };
+
+  const clearQmdDebounceTimer = () => {
+    if (qmdDebounceTimer) {
+      clearTimeout(qmdDebounceTimer);
+      qmdDebounceTimer = undefined;
+    }
+  };
+
+  const markQmdClean = (ctx?: ExtensionContext) => {
+    clearQmdDebounceTimer();
+    qmdDirtyAt = undefined;
+    qmdLastError = undefined;
+    qmdResyncRequested = false;
+    updateUi(ctx || qmdUiContext);
+  };
+
+  const runQmdSyncNow = async (options: {
+    includeEmbed?: boolean;
+    forceEmbed?: boolean;
+    reason?: string;
+    ctx?: ExtensionContext;
+    signal?: AbortSignal;
+  } = {}): Promise<QmdRefreshResult> => {
+    const ctx = options.ctx || qmdUiContext;
+    if (!runtimeState.ready || !runtimeState.config) {
+      throw new Error("Memory system is not configured.");
+    }
+
+    // Coalesce concurrent callers into one QMD process (single-flight lock).
+    // After an in-flight sync completes, re-check and claim before any await so
+    // waiters cannot stampede into multiple child processes.
+    while (true) {
+      if (qmdSyncInFlight) {
+        qmdResyncRequested = true;
+        await qmdSyncInFlight;
+        continue;
+      }
+
+      // Another waiter may have already cleaned the index; skip no-op update-only syncs.
+      if (!qmdDirtyAt && !options.includeEmbed && !options.forceEmbed) {
+        return { warnings: [], updated: true, embedded: false };
+      }
+
+      // Claim the lock synchronously (no await between check and assignment).
+      qmdSyncInFlight = new Promise<void>((resolve) => {
+        qmdSyncFlightResolve = resolve;
+      });
+      break;
+    }
+
+    const config = runtimeState.config;
+    const startedAt = Date.now();
+    const dirtyAtBefore = qmdDirtyAt;
+    qmdSyncing = true;
+    qmdLastError = undefined;
+    updateUi(ctx);
+
+    try {
+      const result = await runQmdRefresh(pi, config, {
+        includeEmbed: options.includeEmbed,
+        forceEmbed: options.forceEmbed,
+        signal: options.signal,
+      });
+
+      if (result.updated) {
+        // Only clear dirty if no newer write landed during the sync.
+        if (shouldClearDirtyAfterSync({ dirtyAtBefore, dirtyAtAfter: qmdDirtyAt, startedAt })) {
+          qmdDirtyAt = undefined;
+        }
+        // Update succeeded → index is usable; embed warnings stay in the return value, not sticky UI.
+        qmdLastError = undefined;
+      } else {
+        qmdLastError = result.warnings[0] || "qmd update failed";
+      }
+
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      qmdLastError = message;
+      return { warnings: [message], updated: false, embedded: false };
+    } finally {
+      qmdSyncing = false;
+      const shouldReschedule = qmdResyncRequested && Boolean(qmdDirtyAt);
+      qmdResyncRequested = false;
+      const resolveFlight = qmdSyncFlightResolve;
+      qmdSyncFlightResolve = undefined;
+      qmdSyncInFlight = undefined;
+      resolveFlight?.();
+      updateUi(ctx || qmdUiContext);
+
+      if (shouldReschedule) {
+        scheduleQmdSync({ immediate: false, ctx: ctx || qmdUiContext });
+      }
+    }
+  };
+
+  const scheduleQmdSync = (options: { immediate?: boolean; includeEmbed?: boolean; ctx?: ExtensionContext } = {}) => {
+    const ctx = options.ctx || qmdUiContext;
+    const config = runtimeState.config;
+    if (!config?.qmdSync.enabled) return;
+
+    clearQmdDebounceTimer();
+    const debounceMs = options.immediate ? 0 : Math.max(0, config.qmdSync.debounceMs);
+    const includeEmbed = options.includeEmbed ?? shouldIncludeEmbedForDebouncedSync(config.qmdSync);
+
+    const kickoff = () => {
+      void runQmdSyncNow({ includeEmbed, ctx }).catch(() => {
+        // Errors are recorded on qmdLastError and surfaced in the widget/status.
+      });
+    };
+
+    if (debounceMs === 0) {
+      kickoff();
+      return;
+    }
+
+    qmdDebounceTimer = setTimeout(kickoff, debounceMs);
+  };
+
+  const markQmdDirty = (ctx?: ExtensionContext, options: { schedule?: boolean; immediate?: boolean } = {}) => {
+    const config = runtimeState.config;
+    if (!config?.qmdSync.enabled) return;
+
+    qmdDirtyAt = Date.now();
+    updateUi(ctx || qmdUiContext);
+
+    if (options.schedule === false) return;
+    scheduleQmdSync({ immediate: options.immediate, ctx: ctx || qmdUiContext });
   };
 
   const clearScheduledMemoryActivity = () => {
@@ -2095,6 +2398,16 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     clearScheduledMemoryActivity();
     memoryActivity = undefined;
+    clearQmdDebounceTimer();
+
+    if (runtimeState.ready && runtimeState.config?.qmdSync.enabled && qmdDirtyAt) {
+      await runQmdSyncNow({
+        includeEmbed: shouldIncludeEmbedForSessionEnd(runtimeState.config.qmdSync),
+        ctx: qmdUiContext,
+      }).catch(() => {
+        // Best-effort end-of-session refresh; leave last error for next session status if needed.
+      });
+    }
   });
 
   pi.on("session_start", async (event, ctx) => {
@@ -2111,6 +2424,9 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         runtimeState.project || "unknown",
         `\n## [${timeLabelNow()}] session_start\n\n- reason: ${event.reason}\n`,
       );
+      if (runtimeState.config.qmdSync.markSessionNotesDirty) {
+        markQmdDirty(ctx);
+      }
     }
 
     if (ctx.hasUI) {
@@ -2129,7 +2445,11 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       const body = buildCompactionFlushBody(event.preparation, runtimeState.config);
       if (!body) return;
       await appendSessionNote(runtimeState.config, runtimeState.project || "unknown", body);
-      updateUi(ctx);
+      if (runtimeState.config.qmdSync.markSessionNotesDirty) {
+        markQmdDirty(ctx);
+      } else {
+        updateUi(ctx);
+      }
     } catch (error) {
       if (ctx.hasUI) {
         const message = error instanceof Error ? error.message : String(error);
@@ -2160,6 +2480,9 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         }
         lines.push("");
         await appendSessionNote(runtimeState.config, runtimeState.project || "unknown", lines.join("\n"));
+        if (runtimeState.config.qmdSync.markSessionNotesDirty) {
+          markQmdDirty(ctx);
+        }
       }
     }
 
@@ -2375,6 +2698,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
             const heading = params.title?.trim() || "memory-update";
             const entry = `\n## [${stamp}] ${heading}\n\n${params.content.trim()}\n`;
             await writeVaultFile(runtimeState.config, "memory/log.md", entry, true);
+            markQmdDirty(ctx);
             return {
               content: [{ type: "text", text: `Appended log entry to memory/log.md` }],
               details: { action: params.action, path: "memory/log.md" },
@@ -2388,6 +2712,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
 
           const appendMode = params.action === "append_file";
           await writeVaultFile(runtimeState.config, path, params.content, appendMode);
+          markQmdDirty(ctx);
           return {
             content: [{ type: "text", text: `${appendMode ? "Appended" : "Wrote"} ${path}` }],
             details: { action: params.action, path },
@@ -2556,6 +2881,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
 
         const logEntry = `\n## [${date}] decision | ${decisionId}\n\nRecorded ${decisionId} for project \`${project}\`: ${safeTitle}\n`;
         await writeVaultFile(runtimeState.config, "memory/log.md", logEntry, true);
+        markQmdDirty(ctx);
 
         return {
           content: [{ type: "text", text: `Recorded ${decisionId} at ${notePath}` }],
@@ -2596,6 +2922,12 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           const result = await ingestMemorySource(pi, runtimeState.config, runtimeState.project, params, signal, (message) => {
             onUpdate?.({ content: [{ type: "text", text: message }] });
           });
+          if (result.qmdRefreshed) {
+            // Ingest already ran a foreground QMD refresh; clear dirty consistently.
+            markQmdClean(ctx);
+          } else {
+            markQmdDirty(ctx);
+          }
           return {
             content: [{ type: "text", text: renderIngestResult(result) }],
             details: result,
@@ -2700,6 +3032,11 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           "memory: ingest failed",
           () => ingestMemorySource(pi, runtimeState.config as MemoryConfig, runtimeState.project, { source, title, kind, copySource, refreshIndex }),
         );
+        if (result.qmdRefreshed) {
+          markQmdClean(ctx);
+        } else {
+          markQmdDirty(ctx);
+        }
         ctx.ui.notify(renderIngestResult(result), result.warnings.length > 0 ? "warning" : "success");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -2767,7 +3104,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           await applyReviewProposal(runtimeState.config, proposal);
           proposal.status = "applied";
           await saveReviewQueue(reviewQueue);
-          updateUi(ctx);
+          markQmdDirty(ctx);
           ctx.ui.notify(`Applied review proposal ${proposal.id}.`, "success");
           return;
         }
@@ -2824,12 +3161,75 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         }
 
         await saveReviewQueue(reviewQueue);
-        updateUi(ctx);
+        if (subcommand === "apply") {
+          markQmdDirty(ctx);
+        } else {
+          updateUi(ctx);
+        }
         ctx.ui.notify(`${subcommand === "apply" ? "Applied" : "Discarded"} ${targets.length} review proposal(s).`, "success");
         return;
       }
 
       ctx.ui.notify("Usage: /memory-review [list|show|pick|apply|discard] [id|next|all]", "warning");
+    },
+  });
+
+  pi.registerCommand("memory-qmd-sync", {
+    description: "Force a foreground QMD refresh: /memory-qmd-sync [update|full] [--force-embed]",
+    handler: async (args, ctx) => {
+      runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
+      reviewQueue = await loadReviewQueue();
+      updateUi(ctx);
+      if (!runtimeState.ready || !runtimeState.config) {
+        ctx.ui.notify("Memory system is not configured.", "error");
+        return;
+      }
+
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      let mode: "update" | "full" = runtimeState.config.qmdSync.mode === "full" ? "full" : "update";
+      let forceEmbed = false;
+      for (const part of parts) {
+        if (part === "update" || part === "full") {
+          mode = part;
+          continue;
+        }
+        if (part === "--force-embed" || part === "-f") {
+          forceEmbed = true;
+          continue;
+        }
+        ctx.ui.notify("Usage: /memory-qmd-sync [update|full] [--force-embed]", "warning");
+        return;
+      }
+
+      clearQmdDebounceTimer();
+      // Operator-forced sync should treat the index as dirty so concurrent writes still coalesce correctly.
+      if (!qmdDirtyAt) qmdDirtyAt = Date.now();
+
+      try {
+        const result = await runWithMemoryActivity(
+          ctx,
+          mode === "full" || forceEmbed ? "memory: syncing QMD (full)…" : "memory: syncing QMD…",
+          "memory: QMD sync complete",
+          "memory: QMD sync failed",
+          () =>
+            runQmdSyncNow({
+              includeEmbed: mode === "full" || forceEmbed,
+              forceEmbed,
+              ctx,
+            }),
+        );
+
+        if (result.updated) {
+          const embedNote = result.embedded ? " (with embed)" : " (update only)";
+          const warningNote = result.warnings.length > 0 ? ` Warnings: ${result.warnings.join("; ")}` : "";
+          ctx.ui.notify(`QMD sync complete${embedNote}.${warningNote}`, result.warnings.length > 0 ? "warning" : "success");
+        } else {
+          ctx.ui.notify(`QMD sync failed: ${result.warnings[0] || "unknown error"}`, "error");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`memory-qmd-sync failed: ${message}`, "error");
+      }
     },
   });
 
@@ -2857,7 +3257,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("memory-init-config", {
-    description: "Create ~/.pi/agent/memory/config.json from the example if it does not exist",
+    description: "Create ~/.pi/agent/memory/config.json from the package example if it does not exist",
     handler: async (_args, ctx) => {
       const configPath = resolveConfigPath();
       if (existsSync(configPath)) {
@@ -2865,15 +3265,13 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         return;
       }
 
-      const examplePath = join(getAgentDir(), "memory", "config.example.json");
-      if (!existsSync(examplePath)) {
-        ctx.ui.notify(`Missing example config: ${examplePath}`, "error");
-        return;
-      }
-
+      const { content, source } = await readExampleConfigSource();
       await mkdir(dirname(configPath), { recursive: true });
-      await writeFile(configPath, await readFile(examplePath, "utf8"), "utf8");
-      ctx.ui.notify(`Wrote ${configPath}. Edit vaultPath/qmdCollection, then run /memory-reload.`, "success");
+      await writeFile(configPath, content, "utf8");
+      ctx.ui.notify(
+        `Wrote ${configPath} from ${source}. Edit vaultPath/qmdCollection, then run /memory-reload.`,
+        "success",
+      );
       runtimeState = await refreshRuntimeState(pi, ctx, runtimeState);
       reviewQueue = await loadReviewQueue();
       updateUi(ctx);
