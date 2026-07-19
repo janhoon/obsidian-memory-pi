@@ -44,6 +44,7 @@ Responsibilities:
 - flush a compact session snapshot before Pi compacts context
 - expose operator commands:
   - `/memory-status`
+  - `/memory-metrics`
   - `/memory-search <query>`
   - `/memory-review [list|show|pick|apply|discard] [id|next|all]`
   - `/memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]`

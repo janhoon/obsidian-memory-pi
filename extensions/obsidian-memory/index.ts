@@ -40,6 +40,20 @@ import {
   routeWritePolicy,
   type WritePolicyRoute,
 } from "./write-policy.js";
+import {
+  createAutoRecallEvent,
+  createProposalApplyEvent,
+  createProposalCreateEvent,
+  createProposalDiscardEvent,
+  createQmdSyncEvent,
+  formatMetricsSummary,
+  mapProposalSourceToMetricTag,
+  parseMetricsNdjson,
+  serializeMetricEvent,
+  summarizeMetrics,
+  type MetricEvent,
+  type ProposalSourceTag,
+} from "./metrics.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -607,6 +621,58 @@ function resolveReviewQueuePath(): string {
   return join(getAgentDir(), "memory", "review-queue.json");
 }
 
+function resolveMetricsPath(): string {
+  return join(getAgentDir(), "memory", "metrics.ndjson");
+}
+
+async function appendMetricEvent(event: MetricEvent): Promise<void> {
+  try {
+    const metricsPath = resolveMetricsPath();
+    await mkdir(dirname(metricsPath), { recursive: true });
+    await appendFile(metricsPath, serializeMetricEvent(event) + "\n", "utf8");
+  } catch {
+    // Metrics are best-effort and local-only; never fail the user-facing path.
+  }
+}
+
+async function loadMetricEvents(): Promise<MetricEvent[]> {
+  const metricsPath = resolveMetricsPath();
+  if (!existsSync(metricsPath)) return [];
+  try {
+    const raw = await readFile(metricsPath, "utf8");
+    return parseMetricsNdjson(raw);
+  } catch {
+    return [];
+  }
+}
+
+async function recordProposalCreateMetric(
+  proposal: Pick<ReviewProposal, "id" | "project" | "source">,
+  options?: { via?: "tool" | "auto_fallback" | "command"; sourceOverride?: ProposalSourceTag },
+): Promise<void> {
+  const source =
+    options?.sourceOverride || mapProposalSourceToMetricTag(proposal.source, { via: options?.via });
+  await appendMetricEvent(
+    createProposalCreateEvent({
+      source,
+      proposalId: proposal.id,
+      project: proposal.project,
+    }),
+  );
+}
+
+async function recordProposalTerminalMetric(
+  proposal: Pick<ReviewProposal, "id" | "project" | "source">,
+  outcome: "applied" | "discarded",
+): Promise<void> {
+  const source = mapProposalSourceToMetricTag(proposal.source);
+  const event =
+    outcome === "applied"
+      ? createProposalApplyEvent({ source, proposalId: proposal.id, project: proposal.project })
+      : createProposalDiscardEvent({ source, proposalId: proposal.id, project: proposal.project });
+  await appendMetricEvent(event);
+}
+
 async function loadReviewQueue(): Promise<ReviewProposal[]> {
   const queuePath = resolveReviewQueuePath();
   if (!existsSync(queuePath)) return [];
@@ -925,7 +991,12 @@ function setStatus(
   }
 }
 
-function renderStatus(state: RuntimeState, qmdStatus?: string, pendingReviewCount: number = 0): string {
+function renderStatus(
+  state: RuntimeState,
+  qmdStatus?: string,
+  pendingReviewCount: number = 0,
+  metricsText?: string,
+): string {
   const lines = [
     `Config: ${state.configPath}`,
     `Ready: ${state.ready ? "yes" : "no"}`,
@@ -967,6 +1038,10 @@ function renderStatus(state: RuntimeState, qmdStatus?: string, pendingReviewCoun
 
   if (state.warnings.length > 0) {
     lines.push("", "Warnings:", ...state.warnings.map((warning) => `- ${warning}`));
+  }
+
+  if (metricsText) {
+    lines.push("", metricsText);
   }
 
   return lines.join("\n");
@@ -2368,16 +2443,21 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     const config = runtimeState.config;
     const startedAt = Date.now();
     const dirtyAtBefore = qmdDirtyAt;
+    const dirtyDurationMs = dirtyAtBefore ? Math.max(0, startedAt - dirtyAtBefore) : 0;
     qmdSyncing = true;
     qmdLastError = undefined;
     updateUi(ctx);
 
+    let syncOk = false;
+    let includeEmbed = false;
     try {
       const result = await runQmdRefresh(pi, config, {
         includeEmbed: options.includeEmbed,
         forceEmbed: options.forceEmbed,
         signal: options.signal,
       });
+      includeEmbed = Boolean(result.embedded || options.includeEmbed || options.forceEmbed);
+      syncOk = Boolean(result.updated);
 
       if (result.updated) {
         // Only clear dirty if no newer write landed during the sync.
@@ -2394,8 +2474,18 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       qmdLastError = message;
+      syncOk = false;
       return { warnings: [message], updated: false, embedded: false };
     } finally {
+      const syncDurationMs = Math.max(0, Date.now() - startedAt);
+      void appendMetricEvent(
+        createQmdSyncEvent({
+          dirtyDurationMs,
+          syncDurationMs,
+          ok: syncOk,
+          includeEmbed,
+        }),
+      );
       qmdSyncing = false;
       const shouldReschedule = qmdResyncRequested && Boolean(qmdDirtyAt);
       qmdResyncRequested = false;
@@ -2499,10 +2589,15 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     }
   };
 
-  const queueProposal = async (proposal: ReviewProposal | undefined, ctx?: ExtensionContext) => {
+  const queueProposal = async (
+    proposal: ReviewProposal | undefined,
+    ctx?: ExtensionContext,
+    options?: { via?: "tool" | "auto_fallback" | "command"; sourceOverride?: ProposalSourceTag },
+  ) => {
     if (!proposal) return undefined;
     reviewQueue = [proposal, ...reviewQueue];
     await saveReviewQueue(reviewQueue);
+    await recordProposalCreateMetric(proposal, options);
     if (ctx) updateUi(ctx);
     return proposal;
   };
@@ -2671,7 +2766,11 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       pendingMemoryIntent &&
       !didPersistMemoryThisTurn(messages)
     ) {
-      const proposal = await queueProposal(buildAutoProposalFromTurn(pendingMemoryIntent, messages, runtimeState.config), ctx);
+      const proposal = await queueProposal(
+        buildAutoProposalFromTurn(pendingMemoryIntent, messages, runtimeState.config),
+        ctx,
+        { via: "auto_fallback", sourceOverride: "fallback" },
+      );
       if (proposal && ctx.hasUI) {
         ctx.ui.notify(`Queued auto memory proposal ${proposal.id} for ${proposal.path}`, "info");
       }
@@ -2760,13 +2859,30 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           }
           systemPrompt += "\n\nWhen obsidian-memory-context is present, treat it as retrieved memory context. Use memory_get before relying on a note beyond the quoted snippet.";
         }
+        void appendMetricEvent(
+          createAutoRecallEvent({
+            hit: results.length > 0,
+            resultCount: results.length,
+            project: runtimeState.project,
+          }),
+        );
         finishMemoryActivity(ctx, activityId, "complete", "memory recall complete");
       } catch (error) {
+        const timedOut = isTimeoutError(error);
+        void appendMetricEvent(
+          createAutoRecallEvent({
+            hit: false,
+            resultCount: 0,
+            project: runtimeState.project,
+            timedOut,
+            failed: !timedOut,
+          }),
+        );
         finishMemoryActivity(
           ctx,
           activityId,
-          isTimeoutError(error) ? "timed_out" : "failed",
-          isTimeoutError(error) ? "memory recall timed out; continuing" : "memory recall failed; continuing",
+          timedOut ? "timed_out" : "failed",
+          timedOut ? "memory recall timed out; continuing" : "memory recall failed; continuing",
         );
         // ignore recall failure and keep other memory behavior
       }
@@ -2789,9 +2905,11 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       return runWithMemoryActivity(ctx, "memory: checking status…", "memory: status complete", "memory: status failed", async () => {
         const qmdStatus = await getQmdStatus(pi, runtimeState);
         const pending = getPendingReviewProposals(reviewQueue);
+        const metricsSummary = summarizeMetrics(await loadMetricEvents());
+        const metricsText = formatMetricsSummary(metricsSummary);
         return {
-          content: [{ type: "text", text: renderStatus(runtimeState, qmdStatus, pending.length) }],
-          details: { runtimeState, qmdStatus, pending },
+          content: [{ type: "text", text: renderStatus(runtimeState, qmdStatus, pending.length, metricsText) }],
+          details: { runtimeState, qmdStatus, pending, metrics: metricsSummary },
         };
       });
     },
@@ -2986,6 +3104,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           };
           reviewQueue = [proposal, ...reviewQueue];
           await saveReviewQueue(reviewQueue);
+          await recordProposalCreateMetric(proposal, { via: "tool", sourceOverride: "explicit" });
           updateUi(ctx);
 
           return {
@@ -3169,7 +3288,22 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       reviewQueue = await loadReviewQueue();
       updateUi(ctx);
       const qmdStatus = await getQmdStatus(pi, runtimeState);
-      ctx.ui.notify(renderStatus(runtimeState, qmdStatus, getPendingReviewProposals(reviewQueue).length), runtimeState.ready ? "info" : "warning");
+      const metricsText = formatMetricsSummary(summarizeMetrics(await loadMetricEvents()));
+      ctx.ui.notify(
+        renderStatus(runtimeState, qmdStatus, getPendingReviewProposals(reviewQueue).length, metricsText),
+        runtimeState.ready ? "info" : "warning",
+      );
+    },
+  });
+
+  pi.registerCommand("memory-metrics", {
+    description: "Show local-only Memory metrics (Proposal apply/discard, Auto-recall hits, QMD lag)",
+    handler: async (_args, ctx) => {
+      const summary = summarizeMetrics(await loadMetricEvents());
+      ctx.ui.notify(
+        `${formatMetricsSummary(summary)}\n\nStore: ${resolveMetricsPath()} (append-only, no network)`,
+        summary.totalEvents > 0 ? "info" : "warning",
+      );
     },
   });
 
@@ -3329,6 +3463,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           await applyReviewProposal(runtimeState.config, proposal);
           proposal.status = "applied";
           await saveReviewQueue(reviewQueue);
+          await recordProposalTerminalMetric(proposal, "applied");
           markQmdDirty(ctx);
           ctx.ui.notify(`Applied review proposal ${proposal.id}.`, "success");
           return;
@@ -3338,6 +3473,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         if (discardNow) {
           proposal.status = "discarded";
           await saveReviewQueue(reviewQueue);
+          await recordProposalTerminalMetric(proposal, "discarded");
           updateUi(ctx);
           ctx.ui.notify(`Discarded review proposal ${proposal.id}.`, "success");
         }
@@ -3377,11 +3513,13 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
             if (proposal.status !== "pending") continue;
             await applyReviewProposal(runtimeState.config, proposal);
             proposal.status = "applied";
+            await recordProposalTerminalMetric(proposal, "applied");
           }
         } else {
           for (const proposal of targets) {
             if (proposal.status !== "pending") continue;
             proposal.status = "discarded";
+            await recordProposalTerminalMetric(proposal, "discarded");
           }
         }
 
