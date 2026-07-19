@@ -40,6 +40,7 @@ Responsibilities:
 - auto-inject relevant memory before answers when triggers match (intent-aware Scope mix: continuity → session+project, decision → project+global, preference → global+project, status → project/Active context; optional first-turn light Recall)
 - write automatic session summaries under `memory/sessions/<project>/YYYY-MM-DD.md`
 - auto-queue review proposals when the user explicitly says things like `remember this` or `save this`
+- significance extract: high-signal turns (decision / preference / correction / milestone) without a memory tool enqueue capped review-only Proposals (source tag `extract`; kill-switch via discard-rate metrics)
 - route memory intent through a write-policy matrix (Write vs Proposal vs Decision vs Ingest) encoded in runtime helpers
 - flush a compact session snapshot before Pi compacts context
 - expose operator commands:

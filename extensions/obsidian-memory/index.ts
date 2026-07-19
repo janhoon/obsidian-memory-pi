@@ -69,6 +69,14 @@ import {
   rankRecallResults,
   type AutoRecallPlan,
 } from "./auto-recall.js";
+import {
+  detectSignificanceSignals,
+  planExtractProposals,
+  shouldDisableExtractFromMetrics,
+  shouldRunExtractCapture,
+  withSignificanceDefaults,
+  type SignificanceConfig,
+} from "./significance.js";
 
 const SEARCH_MODES = ["keyword", "semantic", "hybrid"] as const;
 type SearchMode = (typeof SEARCH_MODES)[number];
@@ -127,6 +135,8 @@ type MemoryConfig = {
     enabled: boolean;
     triggerPatterns: string[];
   };
+  /** Significance extract capture (review-only Proposals when no memory tool ran). */
+  significanceCapture: SignificanceConfig;
   preCompactionFlush: {
     enabled: boolean;
     maxTurns: number;
@@ -449,6 +459,7 @@ function buildDefaultConfigExample(): string {
       enabled: true,
       triggerPatterns: [...DEFAULT_AUTO_PROPOSE_PATTERNS],
     },
+    significanceCapture: withSignificanceDefaults(),
     preCompactionFlush: {
       enabled: DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
@@ -513,6 +524,7 @@ function withDefaults(config: Partial<MemoryConfig>): MemoryConfig {
       enabled: config.autoPropose?.enabled ?? true,
       triggerPatterns: config.autoPropose?.triggerPatterns || [...DEFAULT_AUTO_PROPOSE_PATTERNS],
     },
+    significanceCapture: withSignificanceDefaults(config.significanceCapture),
     preCompactionFlush: {
       enabled: config.preCompactionFlush?.enabled ?? DEFAULT_PRE_COMPACTION_FLUSH.enabled,
       maxTurns: config.preCompactionFlush?.maxTurns || DEFAULT_PRE_COMPACTION_FLUSH.maxTurns,
@@ -1047,6 +1059,7 @@ function renderStatus(
     }`,
     `Auto session notes: ${state.config?.autoSessionNotes.enabled ? "on" : "off"}`,
     `Auto propose memory requests: ${state.config?.autoPropose.enabled ? "on" : "off"}`,
+    `Significance extract: ${state.config?.significanceCapture.enabled ? `on (max ${state.config.significanceCapture.maxProposalsPerTurn}/turn)` : "off"}${state.config?.significanceCapture.disabledByDiscardRate ? " · kill-switch" : ""}`,
     `Pre-compaction flush: ${state.config?.preCompactionFlush.enabled ? "on" : "off"}`,
     `QMD auto-sync: ${state.config?.qmdSync.enabled ? "on" : "off"}`,
     `QMD sync mode: ${state.config?.qmdSync.mode || DEFAULT_QMD_SYNC_CONFIG.mode}`,
@@ -2786,11 +2799,13 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       }
     }
 
+    const alreadyPersisted = didPersistMemoryThisTurn(messages);
+
     if (
       runtimeState.ready &&
       runtimeState.config?.autoPropose.enabled &&
       pendingMemoryIntent &&
-      !didPersistMemoryThisTurn(messages)
+      !alreadyPersisted
     ) {
       const proposal = await queueProposal(
         buildAutoProposalFromTurn(pendingMemoryIntent, messages, runtimeState.config),
@@ -2799,6 +2814,70 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       );
       if (proposal && ctx.hasUI) {
         ctx.ui.notify(`Queued auto memory proposal ${proposal.id} for ${proposal.path}`, "info");
+      }
+    }
+
+    // Significance extract: high-signal turns without memory tools → capped Proposals (review-only).
+    if (runtimeState.ready && runtimeState.config && !alreadyPersisted) {
+      try {
+        const metrics = summarizeMetrics(await loadMetricEvents());
+        const extractRow = metrics.proposals.bySource.find((row) => row.source === "extract");
+        const disabledByDiscardRate = shouldDisableExtractFromMetrics({
+          extractCreated: extractRow?.created || 0,
+          extractDiscarded: extractRow?.discarded || 0,
+          extractApplied: extractRow?.applied || 0,
+        });
+        const sigConfig = withSignificanceDefaults({
+          ...runtimeState.config.significanceCapture,
+          disabledByDiscardRate:
+            runtimeState.config.significanceCapture.disabledByDiscardRate || disabledByDiscardRate,
+        });
+
+        if (shouldRunExtractCapture(sigConfig, { alreadyPersisted })) {
+          const lastUser = [...messages].reverse().find((message) => message?.role === "user");
+          const lastAssistant = [...messages].reverse().find((message) => message?.role === "assistant");
+          const toolNames = [
+            ...new Set(
+              messages
+                .filter((message) => message?.role === "toolResult")
+                .map((message) => message?.toolName)
+                .filter(Boolean)
+                .map(String),
+            ),
+          ];
+          const userText = extractTextFromContent(lastUser?.content);
+          const assistantText = extractTextFromContent(lastAssistant?.content);
+          const hits = detectSignificanceSignals({ userText, assistantText });
+          const drafts = planExtractProposals({
+            hits,
+            userText,
+            assistantText,
+            project: runtimeState.project,
+            maxProposalsPerTurn: sigConfig.maxProposalsPerTurn,
+            toolNames,
+          });
+
+          for (const draft of drafts) {
+            const proposal: ReviewProposal = {
+              id: randomUUID().slice(0, 8),
+              createdAt: new Date().toISOString(),
+              project: runtimeState.project,
+              source: "auto",
+              rationale: draft.rationale,
+              action: draft.action,
+              path: draft.targetPath,
+              title: draft.title,
+              content: draft.content,
+              status: "pending",
+            };
+            await queueProposal(proposal, ctx, { sourceOverride: "extract" });
+            if (ctx.hasUI) {
+              ctx.ui.notify(`Queued extract proposal ${proposal.id} (${draft.kind}) for ${draft.targetPath}`, "info");
+            }
+          }
+        }
+      } catch {
+        // Extract is best-effort; never break agent_end.
       }
     }
 

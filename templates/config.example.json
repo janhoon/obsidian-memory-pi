@@ -73,6 +73,11 @@
       "write this down"
     ]
   },
+  "significanceCapture": {
+    "enabled": true,
+    "maxProposalsPerTurn": 2,
+    "disabledByDiscardRate": false
+  },
   "preCompactionFlush": {
     "enabled": true,
     "maxTurns": 8,
