@@ -80,6 +80,44 @@ assert.equal(truncateMarkdown("hello", 0).truncated, true);
   assert.equal(pack.truncated, false);
 }
 
+// --- assembleCorePack: MEMORY index included when present ---
+{
+  const pack = assembleCorePack(
+    [
+      { path: "memory/working-context.md", content: "# Working\n\ncross-project.\n" },
+      { path: "memory/projects/demo/active-context.md", content: "# Active\n\nin progress.\n" },
+      {
+        path: "memory/projects/demo/MEMORY.md",
+        content: "# MEMORY index\n\n## Focus\n\n- Ship core pack.\n\n## Pointers\n\n- [[active-context]]\n",
+      },
+    ],
+    { project: "demo", maxFileChars: 6000, maxTotalChars: 14000 },
+  );
+  assert.equal(pack.loadedCount, 3);
+  assert.deepEqual(pack.missingPaths, []);
+  assert.ok(pack.messageContent?.includes("MEMORY index"));
+  assert.ok(pack.messageContent?.includes("Ship core pack"));
+  assert.equal(pack.truncated, false);
+}
+
+// --- assembleCorePack: over-budget MEMORY is truncated on inject ---
+{
+  const pack = assembleCorePack(
+    [
+      { path: "memory/working-context.md", content: "W".repeat(50) },
+      { path: "memory/projects/demo/active-context.md", content: "A".repeat(50) },
+      { path: "memory/projects/demo/MEMORY.md", content: "M".repeat(500) },
+    ],
+    { project: "demo", maxFileChars: 80, maxTotalChars: 200 },
+  );
+  assert.ok(pack.truncated);
+  assert.ok(pack.totalChars <= 200);
+  const memoryFile = pack.files.find((f) => f.path.endsWith("MEMORY.md"));
+  assert.ok(memoryFile);
+  assert.ok(memoryFile.includedChars <= 80);
+  assert.ok(memoryFile.originalChars === 500);
+}
+
 // --- assembleCorePack: empty content does not count as loaded ---
 {
   const pack = assembleCorePack([{ path: "memory/working-context.md", content: "   \n" }], {

@@ -26,6 +26,7 @@ assert.equal(isSafeDirectWritePath("memory/working-context.md"), true);
 assert.equal(isSafeDirectWritePath("memory/projects/dotfiles/active-context.md", "dotfiles"), true);
 assert.equal(isSafeDirectWritePath("memory/projects/dotfiles/progress.md", "dotfiles"), true);
 assert.equal(isSafeDirectWritePath("memory/sessions/dotfiles/2026-04-15.md", "dotfiles"), true);
+assert.equal(isSafeDirectWritePath("memory/projects/dotfiles/MEMORY.md", "dotfiles"), true);
 
 assert.equal(isSafeDirectWritePath("memory/glossary.md"), false, "glossary is not safe direct");
 assert.equal(isSafeDirectWritePath("memory/projects/dotfiles/system-patterns.md", "dotfiles"), false);

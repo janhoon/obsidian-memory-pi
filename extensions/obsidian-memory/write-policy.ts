@@ -169,15 +169,18 @@ export function isSafeDirectWritePath(path: string | undefined, project?: string
   if (slug) {
     if (normalized === `memory/projects/${slug}/active-context.md`) return true;
     if (normalized === `memory/projects/${slug}/progress.md`) return true;
+    if (normalized === `memory/projects/${slug}/MEMORY.md`) return true;
     if (normalized.startsWith(`memory/sessions/${slug}/`) && normalized.endsWith(".md")) return true;
   }
 
   // Template-shaped paths without a resolved project still count as chronology-style.
   if (normalized === "memory/projects/{project}/active-context.md") return true;
   if (normalized === "memory/projects/{project}/progress.md") return true;
+  if (normalized === "memory/projects/{project}/MEMORY.md") return true;
   if (/^memory\/sessions\/[^/]+\/.+\.md$/.test(normalized)) return true;
   if (/^memory\/projects\/[^/]+\/active-context\.md$/.test(normalized)) return true;
   if (/^memory\/projects\/[^/]+\/progress\.md$/.test(normalized)) return true;
+  if (/^memory\/projects\/[^/]+\/MEMORY\.md$/.test(normalized)) return true;
 
   return false;
 }
@@ -207,6 +210,7 @@ export function classifyContentClass(input: WritePolicyInput): ContentClass {
   }
   if (path === "memory/working-context.md") return "working_context";
   if (/\/active-context\.md$/.test(path)) return "active_context";
+  if (/\/MEMORY\.md$/.test(path)) return "active_context"; // core-pack index; same direct-Write class as context snapshots
   if (/\/progress\.md$/.test(path)) return "progress";
   if (/^memory\/sessions\//.test(path)) return "session_chronology";
   if (/\/glossary\.md$/.test(path) || path === "memory/glossary.md") return "glossary";
