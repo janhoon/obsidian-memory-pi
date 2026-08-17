@@ -90,14 +90,30 @@ function findHits(text: string, kind: SignificanceKind, cues: Array<{ cue: strin
 }
 
 /**
- * Deterministic significance scan over user + assistant turn text.
+ * True when user text is injected skill XML, a child-completion notice, or a
+ * review wrapper — not a first-person durable claim.
+ */
+export function isExtractNoise(text: string | undefined): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (/<skill\s/i.test(trimmed)) return true;
+  if (/^child\s+sa_[a-z0-9_]+/i.test(trimmed)) return true;
+  if (/^#\s*review\b/i.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Deterministic significance scan over *user* turn text only.
+ * Assistant vocabulary is discussion, not a durable claim.
  * Returns unique kinds ordered by total weight (high first).
  */
 export function detectSignificanceSignals(input: {
   userText?: string;
   assistantText?: string;
 }): SignificanceHit[] {
-  const text = `${input.userText || ""}\n${input.assistantText || ""}`.replace(/\s+/g, " ").trim().toLowerCase();
+  if (isExtractNoise(input.userText)) return [];
+  const text = (input.userText || "").replace(/\s+/g, " ").trim().toLowerCase();
   if (!text) return [];
 
   const all = [
@@ -132,22 +148,60 @@ export type ExtractProposalDraft = {
   contentClass: string;
 };
 
-/** Plausible Proposal targets by significance kind (always reviewable, never doctrine Write). */
-export function targetPathForSignificanceKind(kind: SignificanceKind, project?: string): string {
+/** Staging inbox for extract claims. Never a core-pack snapshot Note. */
+export function targetPathForSignificanceKind(_kind: SignificanceKind, project?: string): string {
   const slug = (project || "").trim();
-  switch (kind) {
-    case "preference":
-      // Global-ish prefs land on working context; project-scoped when project known stays reviewable there too.
-      return slug ? `memory/projects/${slug}/active-context.md` : "memory/working-context.md";
-    case "decision":
-      return slug ? `memory/projects/${slug}/active-context.md` : "memory/working-context.md";
-    case "correction":
-      return slug ? `memory/projects/${slug}/active-context.md` : "memory/working-context.md";
-    case "milestone":
-      return slug ? `memory/projects/${slug}/progress.md` : "memory/working-context.md";
-    default:
-      return slug ? `memory/projects/${slug}/active-context.md` : "memory/working-context.md";
-  }
+  return slug ? `memory/projects/${slug}/inbox.md` : "memory/working/inbox.md";
+}
+
+/**
+ * One-sentence claim from user text around the cue. Never a transcript dump.
+ */
+export function synthesizeExtractClaim(input: {
+  kind: SignificanceKind;
+  cue: string;
+  userText?: string;
+}): string {
+  const raw = (input.userText || "").replace(/\s+/g, " ").trim();
+  if (!raw) return `User expressed a ${input.kind} (“${input.cue}”).`;
+
+  const cue = input.cue.toLowerCase();
+  const sentences = raw.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  const aroundCue = sentences.find((sentence) => sentence.toLowerCase().includes(cue));
+  const claim = aroundCue || sentences[0] || raw;
+  return truncate(claim, 180);
+}
+
+export type ExtractFingerprintRef = {
+  fingerprint: string;
+  project?: string;
+};
+
+export function extractFingerprint(input: {
+  kind: SignificanceKind;
+  content?: string;
+  userText?: string;
+  cue?: string;
+}): string {
+  const claimFromContent = (input.content || "").match(/^- Claim:\s*(.+)$/m)?.[1];
+  const basis = (claimFromContent || input.userText || input.cue || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return `${input.kind}:${basis.slice(0, 160)}`;
+}
+
+export function isDuplicateExtractProposal(
+  draft: { kind: SignificanceKind; content?: string; userText?: string; cue?: string },
+  recent: readonly ExtractFingerprintRef[],
+  project?: string,
+): boolean {
+  const fingerprint = extractFingerprint(draft);
+  return recent.some((item) => {
+    if (item.fingerprint !== fingerprint) return false;
+    if (project === undefined) return true;
+    return (item.project || "") === project;
+  });
 }
 
 function contentClassForKind(kind: SignificanceKind): string {
@@ -176,44 +230,44 @@ export function planExtractProposals(input: {
   project?: string;
   maxProposalsPerTurn?: number;
   toolNames?: string[];
+  recentFingerprints?: readonly ExtractFingerprintRef[];
 }): ExtractProposalDraft[] {
+  if (isExtractNoise(input.userText)) return [];
   if (!isHighSignificance(input.hits)) return [];
 
   const cap = Math.max(0, input.maxProposalsPerTurn ?? DEFAULT_SIGNIFICANCE_CONFIG.maxProposalsPerTurn);
   if (cap === 0) return [];
 
   const drafts: ExtractProposalDraft[] = [];
-  const seenPaths = new Set<string>();
+  const seenKinds = new Set<SignificanceKind>();
+  const recent = input.recentFingerprints ?? [];
 
   for (const hit of input.hits) {
     if (drafts.length >= cap) break;
+    if (seenKinds.has(hit.kind)) continue;
+    seenKinds.add(hit.kind);
 
     const targetPath = targetPathForSignificanceKind(hit.kind, input.project);
-    if (seenPaths.has(targetPath)) continue;
-    seenPaths.add(targetPath);
 
     const contentClass = contentClassForKind(hit.kind);
     const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
-    const userBit = truncate(input.userText, 220);
-    const assistantBit = truncate(input.assistantText, 280);
-    const tools = input.toolNames?.length ? input.toolNames.join(", ") : undefined;
-
+    const claim = synthesizeExtractClaim({
+      kind: hit.kind,
+      cue: hit.cue,
+      userText: input.userText,
+    });
     const content = [
-      `\n## [${stamp}] extract capture (${hit.kind})`,
+      `\n## [${stamp}] extract (${hit.kind})`,
       "",
+      `- Claim: ${claim}`,
       `- Signal: ${hit.kind} (“${hit.cue}”)`,
       `- Write policy: ${contentClass} → propose (extract is review-only)`,
-      userBit ? `- User: ${userBit}` : undefined,
-      assistantBit ? `- Assistant: ${assistantBit}` : undefined,
-      tools ? `- Tools: ${tools}` : undefined,
       "",
       "_Queued by significance extract — review before Apply. Never auto-applied as doctrine._",
       "",
-    ]
-      .filter(Boolean)
-      .join("\n");
+    ].join("\n");
 
-    drafts.push({
+    const draft: ExtractProposalDraft = {
       sourceTag: "extract",
       kind: hit.kind,
       targetPath,
@@ -222,7 +276,13 @@ export function planExtractProposals(input: {
       content,
       action: "append_file",
       contentClass,
-    });
+    };
+
+    if (isDuplicateExtractProposal({ ...draft, userText: input.userText, cue: hit.cue }, recent, input.project)) {
+      continue;
+    }
+
+    drafts.push(draft);
   }
 
   return drafts;

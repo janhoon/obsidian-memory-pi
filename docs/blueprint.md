@@ -34,13 +34,14 @@ Responsibilities:
   - `memory_write`
   - `memory_propose_write`
   - `memory_review_status`
+  - `memory_review_resolve`
   - `memory_audit`
   - `memory_record_decision`
   - `memory_ingest_source`
 - auto-inject relevant memory before answers when triggers match (intent-aware Scope mix: continuity → session+project, decision → project+global, preference → global+project, status → project/Active context; optional first-turn light Recall)
 - write automatic session summaries under `memory/sessions/<project>/YYYY-MM-DD.md`
 - auto-queue review proposals when the user explicitly says things like `remember this` or `save this`
-- significance extract: high-signal turns (decision / preference / correction / milestone) without a memory tool enqueue capped review-only Proposals (source tag `extract`; kill-switch via discard-rate metrics)
+- significance extract: high-signal **user** turns (decision / preference / correction / milestone) without a memory tool enqueue capped review-only Proposals (source tag `extract`; claim body, staged on `inbox.md`, never a core-pack transcript dump; kill-switch via discard-rate metrics)
 - optional idle Dream: after configured idle minutes + session turn threshold, run one automatic Dream (never mid-turn; fully disable-able; does not affect `/memory-dream`)
 - route memory intent through a write-policy matrix (Write vs Proposal vs Decision vs Ingest) encoded in runtime helpers
 - flush a compact session snapshot before Pi compacts context
@@ -50,7 +51,7 @@ Responsibilities:
   - `/memory-summary`
   - `/memory-dream [lookbackDays]`
   - `/memory-search <query>`
-  - `/memory-review [list|show|pick|apply|discard] [id|next|all]`
+  - `/memory-review` / `ctrl+shift+m` open overlay Triage; `list|show|apply|discard` remain scriptable
   - `/memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]`
   - `/memory-audit-now [scope] [project] [staleDays]`
   - `/memory-init-config`
@@ -105,6 +106,7 @@ Current behavior:
 - append a concise session-note entry for each completed user prompt
 - record the last user request, assistant summary, and tool names
 - auto-queue a fallback review proposal when the user explicitly asked to remember something and no memory tool was called
+- significance extract (if no memory tool ran): scan **user** text only, skip skill/child/review noise, queue a claim-shaped Proposal on `inbox.md` (never append transcripts to Active context / progress)
 
 ### `session_before_compact`
 
@@ -118,7 +120,9 @@ Current behavior:
 Current behavior:
 
 - queue durable memory proposals via `memory_propose_write`
-- let the user list/show/pick/apply/discard proposals from `/memory-review`
+- Triage the queue from an overlay (`/memory-review`, `/memory-review pick`, `ctrl+shift+m`)
+- script Apply/Discard via slash or `memory_review_resolve` after a clear human ask
+- order is current project oldest first, then the rest oldest first
 
 ## Tool contracts
 
@@ -188,7 +192,22 @@ Behavior:
 
 - stores a pending write in `~/.pi/agent/memory/review-queue.json`
 - does not mutate the vault immediately
-- surfaces the proposal via `/memory-review` and `memory_review_status`
+- surfaces the proposal via overlay Triage, `/memory-review`, `memory_review_status`, and `memory_review_resolve`
+
+### `memory_review_resolve`
+
+Inputs:
+
+- `action`: `apply | discard`
+- `target`: `ids | next | all | project`
+- optional `ids`
+- optional `project`
+
+Behavior:
+
+- one Review resolve operation shared with overlay and slash
+- only after a clear human ask; never silent Apply
+- `next` / default `project` use current-project-first oldest order; `all` is the entire pending queue
 
 ### `memory_audit`
 
@@ -371,4 +390,4 @@ vault/
 - richer routing for auto-captured memories
 - smarter contradiction detection
 - background indexing status
-- deeper review UI and triage flows
+- review edit / target-Note diffs / Telegram-native review cards

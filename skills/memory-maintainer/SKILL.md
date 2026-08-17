@@ -36,6 +36,7 @@ Runtime helpers encode the same content-class matrix the extension uses for syst
 - any durable claim you are unsure about
 
 When a decision is clearly approved and well-specified, prefer `memory_record_decision` over ad-hoc file edits.
+Queued Proposals are human-resolved. After a clear ask, use `memory_review_resolve`; never Apply or Discard on your own.
 When the user explicitly says things like “remember this”, “save this”, or “make a note”, prefer a reviewable durable capture via `memory_propose_write` unless they clearly want an immediate write on a safe direct target.
 Sources (files, URLs, media) use `memory_ingest_source`, not free-form Write/Proposal of the raw Source.
 

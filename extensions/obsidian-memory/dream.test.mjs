@@ -9,6 +9,7 @@ const sourcePath = join(here, "dream.ts");
 const {
   extractSessionCandidates,
   classifyDreamCandidate,
+  shouldPromoteDreamCandidate,
   planDreamPass,
   dreamLookbackDates,
   sessionNotePath,
@@ -116,5 +117,55 @@ assert.equal(sessionNotePath("demo", "2026-04-15"), "memory/sessions/demo/2026-0
   assert.equal(dates[0], "2026-04-15");
 }
 assert.equal(withDreamDefaults({ lookbackDays: 7 }).lookbackDays, 7);
+
+assert.equal(shouldPromoteDreamCandidate("preference"), true);
+assert.equal(shouldPromoteDreamCandidate("other"), false);
+assert.equal(shouldPromoteDreamCandidate("progress"), true);
+
+// YAML frontmatter and meta keys are not Dream candidates
+{
+  const content = [
+    "---",
+    "type: context",
+    "scope: session",
+    "project: demo",
+    "relevance: low",
+    "last_reviewed: 2026-08-16",
+    "---",
+    "# Session notes",
+    "",
+    "- User: We shipped the core pack",
+    "- Assistant: Great progress on MEMORY index",
+  ].join("\n");
+  const cands = extractSessionCandidates("memory/sessions/demo/2026-08-16.md", content);
+  assert.ok(cands.some((c) => /shipped the core pack/i.test(c.text)));
+  assert.ok(!cands.some((c) => /^(type|scope|project|relevance|last_reviewed):/i.test(c.text)));
+}
+
+// Residual "other" does not become a Dream Proposal
+{
+  const plan = planDreamPass({
+    project: "demo",
+    date: "2026-08-16",
+    sessionNotes: [
+      {
+        path: "memory/sessions/demo/2026-08-16.md",
+        content: [
+          "---",
+          "type: context",
+          "scope: session",
+          "project: demo",
+          "---",
+          "- User: hello there today",
+        ].join("\n"),
+      },
+    ],
+    config: { maxProposals: 5 },
+  });
+  assert.equal(plan.proposals.length, 0);
+  assert.ok(!plan.proposals.some((p) => p.kind === "other"));
+  assert.ok(!plan.directWrites.some((w) => w.path.endsWith("active-context.md")));
+  assert.ok(!plan.directWrites.some((w) => w.path.endsWith("MEMORY.md")));
+}
 
 console.log("dream.test.mjs: all assertions passed");

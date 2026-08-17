@@ -128,6 +128,14 @@ _Avoid_: get, open, fetch (as the domain term)
 The store of pending Proposals awaiting human action.
 _Avoid_: inbox, backlog, draft folder
 
+**Triage**:
+The human pass that Applies or Discards one focused Proposal and then advances to the next. The default review job.
+_Avoid_: audit (health pass), inspect, edit
+
+**Inspect**:
+Reading more of a focused Proposal (full content, later a target-Note diff) before Apply or Discard. Secondary to Triage; not a different queue.
+_Avoid_: triage, audit, edit, show (the slash dump)
+
 **Apply**:
 Accept a Proposal and perform its Write.
 _Avoid_: approve, commit, merge (as the canonical verb)
@@ -135,6 +143,10 @@ _Avoid_: approve, commit, merge (as the canonical verb)
 **Discard**:
 Reject a Proposal without writing.
 _Avoid_: reject, delete, ignore (as the canonical verb)
+
+**Review resolve**:
+Applying or Discarding named Proposals. Overlay, slash, and the review-resolve tool are surfaces over this one operation.
+_Avoid_: commit, approve, ignore, separate apply paths per surface
 
 ### Health
 

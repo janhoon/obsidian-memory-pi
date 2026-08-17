@@ -85,12 +85,26 @@ const FOCUS_RE = /\b(next step|in progress|working on|focus:|blocker|todo:|plan 
 /**
  * Extract durable-looking bullet / line candidates from Session note markdown.
  */
+function stripYamlFrontmatter(content: string): string {
+  return content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+}
+
+const DREAM_META_LINE =
+  /^(type|scope|project|relevance|last_reviewed|status|decision_id)\s*:/i;
+
+/** Residual "other" is noise, not a durable Dream promotion. */
+export function shouldPromoteDreamCandidate(kind: DreamCandidateKind): boolean {
+  return kind !== "other";
+}
+
 export function extractSessionCandidates(sessionPath: string, content: string): Array<{ text: string; sourcePath: string }> {
-  const lines = content.split("\n");
+  const body = stripYamlFrontmatter(content);
+  const lines = body.split("\n");
   const out: Array<{ text: string; sourcePath: string }> = [];
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
+    if (DREAM_META_LINE.test(line)) continue;
     // Session entries: "- User: …", "- Assistant: …", free bullets
     let text = line;
     if (/^[-*]\s+/.test(text)) text = text.replace(/^[-*]\s+/, "");
@@ -101,6 +115,7 @@ export function extractSessionCandidates(sessionPath: string, content: string): 
     if (text.length < 12) continue;
     if (/^session_start\b/i.test(text)) continue;
     if (/^turn\b/i.test(text) && text.length < 20) continue;
+    if (DREAM_META_LINE.test(text)) continue;
     out.push({ text, sourcePath: sessionPath });
   }
   return out;
@@ -337,9 +352,11 @@ export function planDreamPass(input: {
     .map((c) => c.text);
 
   const directWrites: DreamDirectWrite[] = [];
+  const hasCoreMaterial =
+    focusBullets.length > 0 || progressBullets.length > 0 || decisionPointers.length > 0 || riskBullets.length > 0;
 
-  // Always refresh Active context when we have any session material or focus/progress.
-  if (input.sessionNotes.length > 0) {
+  // Refresh Active context / MEMORY only when real focus/progress/decision/risk material exists.
+  if (hasCoreMaterial) {
     directWrites.push({
       path: `memory/projects/${project}/active-context.md`,
       content: buildActiveContextDreamBody(input.existingActiveContext, focusBullets, {
@@ -374,8 +391,8 @@ export function planDreamPass(input: {
     });
   }
 
-  // Proposals for sensitive kinds (capped).
-  const proposalCandidates = candidates.filter((c) => c.action === "propose");
+  // Proposals for sensitive kinds (capped). Residual "other" is never promoted.
+  const proposalCandidates = candidates.filter((c) => c.action === "propose" && shouldPromoteDreamCandidate(c.kind));
   const proposals: DreamProposalDraft[] = [];
   const seen = new Set<string>();
   for (const c of proposalCandidates) {

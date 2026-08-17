@@ -17,13 +17,14 @@ This package is the first implementation pass. It currently provides:
   - `memory_write`
   - `memory_propose_write`
   - `memory_review_status`
+  - `memory_review_resolve`
   - `memory_audit`
   - `memory_record_decision`
   - `memory_ingest_source`
   - `/memory-status`
   - `/memory-search <query>`
   - `/memory-ingest [--kind image|video|audio|document] [--copy|--no-copy] [--no-refresh] <path-or-url> [title]`
-  - `/memory-review [list|show|pick|apply|discard] [id|next|all]`
+  - `/memory-review` opens Proposal Triage (`ctrl+shift+m`); `list|show|apply|discard` stay scriptable
   - `/memory-audit-now [scope] [project] [staleDays]`
   - `/memory-qmd-sync [update|full] [--force-embed]`
   - `/memory-init-config`
@@ -56,7 +57,7 @@ This is still an early system, not the finished product. The following are still
 - smarter contradiction detection beyond heuristic candidates
 - richer source-ingest automation beyond the initial Docling local-path/URL flow
 - richer policy for where auto-captured facts should land beyond active-context / working-context
-- richer review workflows beyond the current widget + picker
+- richer review workflows beyond overlay Triage (edit, target-Note diffs, Telegram-native review)
 
 ## Package layout
 

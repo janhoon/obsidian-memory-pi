@@ -71,6 +71,7 @@ import {
 } from "./auto-recall.js";
 import {
   detectSignificanceSignals,
+  extractFingerprint,
   planExtractProposals,
   shouldDisableExtractFromMetrics,
   shouldRunExtractCapture,
@@ -89,6 +90,19 @@ import {
   withDreamDefaults,
   type DreamConfig,
 } from "./dream.js";
+import {
+  TRIAGE_SHORTCUT,
+  findReviewProposal,
+  formatProposalDetails,
+  formatResolveResult,
+  formatReviewList,
+  formatReviewWidgetCue,
+  getPendingReviewProposals,
+  planReviewResolve,
+  type ReviewProposal,
+  type ReviewResolveAction,
+} from "./review-queue.js";
+import { ReviewTriageOverlay } from "./review-triage.js";
 import {
   createDreamIdleState,
   evaluateDreamIdleTrigger,
@@ -210,19 +224,6 @@ type QmdSearchResult = {
   context?: string;
   snippet?: string;
   body?: string;
-};
-
-type ReviewProposal = {
-  id: string;
-  createdAt: string;
-  project?: string;
-  source: "assistant" | "auto" | "manual";
-  rationale?: string;
-  action: "append_log" | "append_file" | "write_file";
-  path?: string;
-  title?: string;
-  content: string;
-  status: "pending" | "applied" | "discarded";
 };
 
 type PendingMemoryIntent = {
@@ -385,6 +386,12 @@ const MEMORY_PROPOSE_WRITE_SCHEMA = Type.Object({
   project: Type.Optional(Type.String({ description: "Project slug override" })),
 });
 const MEMORY_REVIEW_STATUS_SCHEMA = Type.Object({});
+const MEMORY_REVIEW_RESOLVE_SCHEMA = Type.Object({
+  action: StringEnum(["apply", "discard"] as const),
+  target: StringEnum(["ids", "next", "all", "project"] as const),
+  ids: Type.Optional(Type.Array(Type.String(), { description: "Proposal ids when target=ids" })),
+  project: Type.Optional(Type.String({ description: "Project slug when target=project; defaults to the current project" })),
+});
 const MEMORY_AUDIT_SCHEMA = Type.Object({
   scope: Type.Optional(StringEnum(SCOPES)),
   project: Type.Optional(Type.String({ description: "Project slug override" })),
@@ -740,10 +747,10 @@ async function recordProposalCreateMetric(
 }
 
 async function recordProposalTerminalMetric(
-  proposal: Pick<ReviewProposal, "id" | "project" | "source">,
+  proposal: Pick<ReviewProposal, "id" | "project" | "source" | "origin">,
   outcome: "applied" | "discarded",
 ): Promise<void> {
-  const source = mapProposalSourceToMetricTag(proposal.source);
+  const source = proposal.origin || mapProposalSourceToMetricTag(proposal.source);
   const event =
     outcome === "applied"
       ? createProposalApplyEvent({ source, proposalId: proposal.id, project: proposal.project })
@@ -768,19 +775,6 @@ async function saveReviewQueue(queue: ReviewProposal[]): Promise<void> {
   const queuePath = resolveReviewQueuePath();
   await mkdir(dirname(queuePath), { recursive: true });
   await writeFile(queuePath, JSON.stringify(queue, null, 2) + "\n", "utf8");
-}
-
-function getPendingReviewProposals(queue: ReviewProposal[]): ReviewProposal[] {
-  return queue.filter((item) => item.status === "pending");
-}
-
-function resolveProposalTarget(proposal: Pick<ReviewProposal, "action" | "path">): string {
-  return proposal.action === "append_log" ? "memory/log.md" : proposal.path || "(missing path)";
-}
-
-function renderProposalPreview(proposal: ReviewProposal): string {
-  const preview = proposal.content.replace(/\s+/g, " ").trim().slice(0, 100);
-  return `${proposal.id} · ${proposal.action} · ${resolveProposalTarget(proposal)}${preview ? ` · ${preview}` : ""}`;
 }
 
 function looksLikeSourceOffer(prompt: string): boolean {
@@ -981,7 +975,7 @@ function buildWidgetLines(
   activity?: MemoryActivity,
   qmdIndex?: QmdIndexUiState,
 ): string[] {
-  const pending = getPendingReviewProposals(pendingQueue);
+  const pending = getPendingReviewProposals(pendingQueue, state.project);
   const review = ctx.ui.theme.fg(pending.length > 0 ? "warning" : "dim", `review ${pending.length} pending`);
   const notes = ctx.ui.theme.fg(sessionNotesEnabled ? "success" : "dim", `session notes ${sessionNotesEnabled ? "on" : "off"}`);
   const autoCapture = ctx.ui.theme.fg(state.config?.autoPropose.enabled ? "success" : "dim", `auto capture ${state.config?.autoPropose.enabled ? "on" : "off"}`);
@@ -1021,14 +1015,9 @@ function buildWidgetLines(
 
   if (pending.length > 0) {
     const next = pending[0];
-    lines.push(ctx.ui.theme.fg("warning", `next ${next.id} → ${resolveProposalTarget(next)}`));
-    lines.push(ctx.ui.theme.fg("dim", truncateText(next.content, 96)));
-    lines.push(
-      ctx.ui.theme.fg(
-        "dim",
-        pending.length > 1 ? `+${pending.length - 1} more · /memory-review pick` : `/memory-review pick · /memory-review apply ${next.id}`,
-      ),
-    );
+    const cue = formatReviewWidgetCue({ pendingCount: pending.length, next, shortcut: TRIAGE_SHORTCUT });
+    if (cue.nextLine) lines.push(ctx.ui.theme.fg("warning", cue.nextLine));
+    if (cue.hintLine) lines.push(ctx.ui.theme.fg("dim", cue.hintLine));
   } else if (pendingIntent) {
     lines.push(ctx.ui.theme.fg("accent", `armed → will queue a review proposal after this reply (${pendingIntent.matchedPattern})`));
   }
@@ -1048,7 +1037,7 @@ function setStatus(
   if (!ctx.hasUI) return;
 
   if (state.ready) {
-    const pendingReviewCount = getPendingReviewProposals(pendingQueue).length;
+    const pendingReviewCount = getPendingReviewProposals(pendingQueue, state.project).length;
     const suffix = pendingReviewCount > 0 ? ` +${pendingReviewCount} review` : "";
     const qmdSuffix = qmdIndex?.syncing ? " · qmd syncing" : qmdIndex?.dirty ? " · qmd stale" : "";
     const coreEnabled = state.config?.coreLoad.enabled ?? DEFAULT_CORE_LOAD_CONFIG.enabled;
@@ -2670,17 +2659,107 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     }
   };
 
+  const currentProject = () => runtimeState.project;
+
+  const persistResolvedProposals = async (
+    action: ReviewResolveAction,
+    proposals: ReviewProposal[],
+    ctx?: ExtensionContext,
+  ): Promise<string> => {
+    if (action === "apply") {
+      if (!runtimeState.ready || !runtimeState.config) {
+        throw new Error("Memory system is not configured.");
+      }
+      for (const proposal of proposals) {
+        if (proposal.status !== "pending") continue;
+        await applyReviewProposal(runtimeState.config, proposal);
+        proposal.status = "applied";
+        await recordProposalTerminalMetric(proposal, "applied");
+      }
+    } else {
+      for (const proposal of proposals) {
+        if (proposal.status !== "pending") continue;
+        proposal.status = "discarded";
+        await recordProposalTerminalMetric(proposal, "discarded");
+      }
+    }
+    await saveReviewQueue(reviewQueue);
+    if (action === "apply") {
+      markQmdDirty(ctx);
+    } else {
+      updateUi(ctx);
+    }
+    return formatResolveResult(action, proposals);
+  };
+
+  const openTriageOverlay = async (ctx: ExtensionContext): Promise<void> => {
+    reviewQueue = await loadReviewQueue();
+    const pending = getPendingReviewProposals(reviewQueue, currentProject());
+    if (pending.length === 0) {
+      ctx.ui.notify("No pending review proposals.", "warning");
+      updateUi(ctx);
+      return;
+    }
+    if (!ctx.hasUI) {
+      ctx.ui.notify(formatReviewList(reviewQueue, currentProject()), "info");
+      return;
+    }
+
+    const result = await ctx.ui.custom<"leave" | "empty">(
+      (tui, theme, _keybindings, done) => {
+        const overlay = new ReviewTriageOverlay({
+          theme,
+          requestRender: () => tui.requestRender(),
+          getQueue: () => reviewQueue,
+          currentProject: currentProject(),
+          onNotify: (message, level) => ctx.ui.notify(message, level ?? "info"),
+          onResolve: async (action, proposal) => {
+            const message = await persistResolvedProposals(action, [proposal], ctx);
+            ctx.ui.notify(message, "info");
+          },
+          done,
+        });
+        return {
+          render: (width) => overlay.render(width),
+          handleInput: (data) => {
+            overlay.handleInput(data);
+            tui.requestRender();
+          },
+          invalidate: () => overlay.invalidate(),
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          anchor: "center",
+          width: "80%",
+          maxHeight: "80%",
+          minWidth: 48,
+        },
+      },
+    );
+    updateUi(ctx);
+    if (result === "empty") {
+      ctx.ui.notify("Review queue empty.", "info");
+    }
+  };
+
   const queueProposal = async (
     proposal: ReviewProposal | undefined,
     ctx?: ExtensionContext,
     options?: { via?: "tool" | "auto_fallback" | "command"; sourceOverride?: ProposalSourceTag },
   ) => {
     if (!proposal) return undefined;
-    reviewQueue = [proposal, ...reviewQueue];
+    const origin =
+      proposal.origin ||
+      options?.sourceOverride ||
+      mapProposalSourceToMetricTag(proposal.source, { via: options?.via });
+    const stored: ReviewProposal = { ...proposal, origin };
+    reviewQueue = [stored, ...reviewQueue];
     await saveReviewQueue(reviewQueue);
-    await recordProposalCreateMetric(proposal, options);
+    await recordProposalCreateMetric(stored, options);
     if (ctx) updateUi(ctx);
-    return proposal;
+    return stored;
   };
 
   const clearDreamIdleTimer = () => {
@@ -3033,6 +3112,19 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
           const userText = extractTextFromContent(lastUser?.content);
           const assistantText = extractTextFromContent(lastAssistant?.content);
           const hits = detectSignificanceSignals({ userText, assistantText });
+          const recentFingerprints = reviewQueue
+            .filter((item) => item.origin === "extract" || item.title?.startsWith("extract-"))
+            .map((item) => ({
+              fingerprint: extractFingerprint({
+                kind: (item.title?.replace(/^extract-/, "") || "decision") as
+                  | "decision"
+                  | "preference"
+                  | "correction"
+                  | "milestone",
+                content: item.content,
+              }),
+              project: item.project,
+            }));
           const drafts = planExtractProposals({
             hits,
             userText,
@@ -3040,6 +3132,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
             project: runtimeState.project,
             maxProposalsPerTurn: sigConfig.maxProposalsPerTurn,
             toolNames,
+            recentFingerprints,
           });
 
           for (const draft of drafts) {
@@ -3048,6 +3141,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
               createdAt: new Date().toISOString(),
               project: runtimeState.project,
               source: "auto",
+              origin: "extract",
               rationale: draft.rationale,
               action: draft.action,
               path: draft.targetPath,
@@ -3199,7 +3293,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       return runWithMemoryActivity(ctx, "memory: checking status…", "memory: status complete", "memory: status failed", async () => {
         const qmdStatus = await getQmdStatus(pi, runtimeState);
-        const pending = getPendingReviewProposals(reviewQueue);
+        const pending = getPendingReviewProposals(reviewQueue, currentProject());
         const metricsSummary = summarizeMetrics(await loadMetricEvents());
         const metricsText = formatMetricsSummary(metricsSummary);
         return {
@@ -3404,7 +3498,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
 
           return {
             content: [{ type: "text", text: `Queued review proposal ${proposal.id}` }],
-            details: { proposal, pendingCount: getPendingReviewProposals(reviewQueue).length },
+            details: { proposal, pendingCount: getPendingReviewProposals(reviewQueue, currentProject()).length },
           };
         },
       );
@@ -3416,17 +3510,55 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
     label: "Memory Review Status",
     description: "List pending proposed memory writes waiting for review.",
     promptSnippet: "Inspect queued memory write proposals awaiting human review.",
+    promptGuidelines: [
+      "List pending Proposals in Triage order: current project oldest first, then the rest oldest first.",
+      "Do not Apply or Discard from this tool. After a clear user ask, use memory_review_resolve.",
+      "If the user says those and more than one reading exists, list first and ask which ids.",
+    ],
     parameters: MEMORY_REVIEW_STATUS_SCHEMA,
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       return runWithMemoryActivity(ctx, "memory: checking review…", "memory: review complete", "memory: review failed", async () => {
-        const pending = getPendingReviewProposals(reviewQueue);
-        const text =
-          pending.length === 0
-            ? "No pending review proposals."
-            : pending.map((proposal) => `- ${renderProposalPreview(proposal)}`).join("\n");
+        const pending = getPendingReviewProposals(reviewQueue, currentProject());
+        return {
+          content: [{ type: "text", text: formatReviewList(reviewQueue, currentProject()) }],
+          details: { pending },
+        };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_review_resolve",
+    label: "Memory Review Resolve",
+    description: "Apply or Discard named pending Proposals after a clear human ask.",
+    promptSnippet: "Resolve queued memory Proposals only when the user explicitly asks to Apply or Discard them.",
+    promptGuidelines: [
+      "Call memory_review_resolve only after a clear user ask in this turn. Never Apply or Discard on your own.",
+      "Prefer listing with memory_review_status, then pass explicit ids. If those is ambiguous, ask.",
+      "target=next and target=project use current-project-first oldest order. target=all is the entire pending queue.",
+      "There is no source filter. Do not invent extract or similar mass filters.",
+    ],
+    parameters: MEMORY_REVIEW_RESOLVE_SCHEMA,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return runWithMemoryActivity(ctx, "memory: resolving review…", "memory: review resolve complete", "memory: review resolve failed", async () => {
+        reviewQueue = await loadReviewQueue();
+        const plan = planReviewResolve(
+          reviewQueue,
+          {
+            action: params.action,
+            target: params.target,
+            ids: params.ids,
+            project: params.project,
+          },
+          currentProject(),
+        );
+        if (!plan.ok) {
+          throw new Error(plan.reason);
+        }
+        const text = await persistResolvedProposals(plan.action, plan.proposals, ctx);
         return {
           content: [{ type: "text", text }],
-          details: { pending },
+          details: { action: plan.action, ids: plan.proposals.map((proposal) => proposal.id) },
         };
       });
     },
@@ -3677,7 +3809,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       const qmdStatus = await getQmdStatus(pi, runtimeState);
       const metricsText = formatMetricsSummary(summarizeMetrics(await loadMetricEvents()));
       ctx.ui.notify(
-        renderStatus(runtimeState, qmdStatus, getPendingReviewProposals(reviewQueue).length, metricsText),
+        renderStatus(runtimeState, qmdStatus, getPendingReviewProposals(reviewQueue, currentProject()).length, metricsText),
         runtimeState.ready ? "info" : "warning",
       );
     },
@@ -3792,135 +3924,69 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("memory-review", {
-    description: "Review queued memory writes: /memory-review [list|show|pick|apply|discard] [id|next|all]",
+    description: "Triage queued memory writes: /memory-review [list|show|pick|apply|discard] [id|next|all]",
     handler: async (args, ctx) => {
       reviewQueue = await loadReviewQueue();
       const [subcommandRaw, targetRaw] = args.trim().split(/\s+/, 2).filter(Boolean);
-      const subcommand = (subcommandRaw || "list").toLowerCase();
-      const pending = getPendingReviewProposals(reviewQueue);
-      const findProposal = (token: string | undefined) => {
-        if (!token || token === "next") return pending[0];
-        return reviewQueue.find((proposal) => proposal.id === token || proposal.id.startsWith(token));
-      };
-      const formatDetails = (proposal: ReviewProposal) =>
-        [
-          `ID: ${proposal.id}`,
-          `Status: ${proposal.status}`,
-          `Action: ${proposal.action}`,
-          `Project: ${proposal.project || "(none)"}`,
-          `Path: ${resolveProposalTarget(proposal)}`,
-          `Created: ${proposal.createdAt}`,
-          proposal.rationale ? `Rationale: ${proposal.rationale}` : undefined,
-          "",
-          proposal.content,
-        ]
-          .filter(Boolean)
-          .join("\n");
+      const subcommand = (subcommandRaw || "").toLowerCase();
+      const project = currentProject();
 
-      if (subcommand === "list") {
-        const text = pending.length === 0 ? "No pending review proposals." : pending.map((proposal) => `- ${renderProposalPreview(proposal)}`).join("\n");
-        updateUi(ctx);
-        ctx.ui.notify(text, pending.length > 0 ? "info" : "warning");
+      if (!subcommand || subcommand === "pick") {
+        await openTriageOverlay(ctx);
         return;
       }
 
-      if (subcommand === "pick") {
-        if (!ctx.hasUI) {
-          ctx.ui.notify("/memory-review pick requires interactive mode.", "error");
-          return;
-        }
-        if (pending.length === 0) {
-          ctx.ui.notify("No pending review proposals.", "warning");
-          return;
-        }
-
-        const options = pending.map((proposal) => renderProposalPreview(proposal));
-        const choice = await ctx.ui.select("Select a pending memory proposal", options);
-        if (!choice) return;
-        const proposal = pending[options.indexOf(choice)];
-        if (!proposal) return;
-
-        ctx.ui.notify(formatDetails(proposal), "info");
-        const applyNow = await ctx.ui.confirm("Apply proposal?", `${proposal.id} → ${resolveProposalTarget(proposal)}`);
-        if (applyNow) {
-          if (!runtimeState.ready || !runtimeState.config) {
-            ctx.ui.notify("Memory system is not configured.", "error");
-            return;
-          }
-          await applyReviewProposal(runtimeState.config, proposal);
-          proposal.status = "applied";
-          await saveReviewQueue(reviewQueue);
-          await recordProposalTerminalMetric(proposal, "applied");
-          markQmdDirty(ctx);
-          ctx.ui.notify(`Applied review proposal ${proposal.id}.`, "success");
-          return;
-        }
-
-        const discardNow = await ctx.ui.confirm("Discard proposal instead?", "Select No to keep it pending.");
-        if (discardNow) {
-          proposal.status = "discarded";
-          await saveReviewQueue(reviewQueue);
-          await recordProposalTerminalMetric(proposal, "discarded");
-          updateUi(ctx);
-          ctx.ui.notify(`Discarded review proposal ${proposal.id}.`, "success");
-        }
+      if (subcommand === "list") {
+        const text = formatReviewList(reviewQueue, project);
+        updateUi(ctx);
+        ctx.ui.notify(text, text === "No pending review proposals." ? "warning" : "info");
         return;
       }
 
       if (subcommand === "show") {
-        const proposal = findProposal(targetRaw);
+        const proposal = findReviewProposal(reviewQueue, targetRaw, project);
         if (!proposal) {
           ctx.ui.notify("Usage: /memory-review show <id|next>", "warning");
           return;
         }
-        ctx.ui.notify(formatDetails(proposal), "info");
+        ctx.ui.notify(formatProposalDetails(proposal), "info");
         return;
       }
 
       if (subcommand === "apply" || subcommand === "discard") {
-        const targets =
-          targetRaw === "all"
-            ? pending
-            : (() => {
-                const proposal = findProposal(targetRaw);
-                return proposal ? [proposal] : [];
-              })();
-
-        if (targets.length === 0) {
-          ctx.ui.notify(`Usage: /memory-review ${subcommand} <id|next|all>`, "warning");
+        const target = !targetRaw ? "next" : targetRaw === "all" ? "all" : "ids";
+        const plan = planReviewResolve(
+          reviewQueue,
+          {
+            action: subcommand,
+            target,
+            ids: target === "ids" ? [targetRaw] : undefined,
+          },
+          project,
+        );
+        if (!plan.ok) {
+          ctx.ui.notify(plan.reason || `Usage: /memory-review ${subcommand} <id|next|all>`, "warning");
           return;
         }
-
-        if (subcommand === "apply") {
-          if (!runtimeState.ready || !runtimeState.config) {
-            ctx.ui.notify("Memory system is not configured.", "error");
-            return;
-          }
-          for (const proposal of targets) {
-            if (proposal.status !== "pending") continue;
-            await applyReviewProposal(runtimeState.config, proposal);
-            proposal.status = "applied";
-            await recordProposalTerminalMetric(proposal, "applied");
-          }
-        } else {
-          for (const proposal of targets) {
-            if (proposal.status !== "pending") continue;
-            proposal.status = "discarded";
-            await recordProposalTerminalMetric(proposal, "discarded");
-          }
+        try {
+          const message = await persistResolvedProposals(plan.action, plan.proposals, ctx);
+          ctx.ui.notify(message, "info");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(message, "error");
         }
-
-        await saveReviewQueue(reviewQueue);
-        if (subcommand === "apply") {
-          markQmdDirty(ctx);
-        } else {
-          updateUi(ctx);
-        }
-        ctx.ui.notify(`${subcommand === "apply" ? "Applied" : "Discarded"} ${targets.length} review proposal(s).`, "success");
         return;
       }
 
       ctx.ui.notify("Usage: /memory-review [list|show|pick|apply|discard] [id|next|all]", "warning");
+    },
+  });
+
+  pi.registerShortcut(TRIAGE_SHORTCUT, {
+    description: "Open memory Proposal Triage",
+    handler: async (ctx) => {
+      reviewQueue = await loadReviewQueue();
+      await openTriageOverlay(ctx);
     },
   });
 
@@ -4054,7 +4120,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
       updateUi(ctx);
 
       const project = runtimeState.project || "unknown";
-      const pendingCount = getPendingReviewProposals(reviewQueue).length;
+      const pendingCount = getPendingReviewProposals(reviewQueue, currentProject()).length;
       const events = await loadMetricEvents();
       const automation = latestMetricTimestamps(events);
 
@@ -4173,7 +4239,7 @@ export default function obsidianMemoryPackage(pi: ExtensionAPI) {
         runtimeState.corePack = undefined;
       }
       updateUi(ctx);
-      ctx.ui.notify(renderStatus(runtimeState, undefined, getPendingReviewProposals(reviewQueue).length), runtimeState.ready ? "success" : "warning");
+      ctx.ui.notify(renderStatus(runtimeState, undefined, getPendingReviewProposals(reviewQueue, currentProject()).length), runtimeState.ready ? "success" : "warning");
     },
   });
 }

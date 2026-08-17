@@ -25,8 +25,8 @@ Dream consolidates short-lived Session chronology into durable Wiki structure.
 
 1. Confirm project slug (`memory_status` if unsure).
 2. Run `/memory-dream` (optional lookback days).
-3. Review queued Proposals via `/memory-review` or `memory_review_status`.
-4. Apply only what the human accepts.
+3. Review queued Proposals via overlay Triage (`/memory-review` / `ctrl+shift+m`) or `memory_review_status`.
+4. Apply or Discard only after a human ask. Chat may call `memory_review_resolve`; never resolve on your own.
 
 ## Out of scope
 
